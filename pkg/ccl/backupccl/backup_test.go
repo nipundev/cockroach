@@ -261,6 +261,9 @@ func TestBackupRestoreJobTagAndLabel(t *testing.T) {
 	tc, _, _, cleanupFn := backupRestoreTestSetupWithParams(t, numNodes, numAccounts, InitManualReplication,
 		base.TestClusterArgs{
 			ServerArgs: base.TestServerArgs{
+				DefaultTestTenant: base.TestDoesNotWorkWithSharedProcessModeButWeDontKnowWhyYet(
+					base.TestTenantProbabilistic, 113857, /* issueNumber */
+				),
 				Knobs: base.TestingKnobs{
 					DistSQL: &execinfra.TestingKnobs{
 						SetupFlowCb: func(ctx context.Context, _ base.SQLInstanceID, _ *execinfrapb.SetupFlowRequest) error {
@@ -7427,8 +7430,9 @@ func TestClientDisconnect(t *testing.T) {
 			// Make credentials for the new connection.
 			sqlDB.Exec(t, `CREATE USER testuser`)
 			sqlDB.Exec(t, `GRANT admin TO testuser`)
-			pgURL, cleanup := sqlutils.PGUrl(t, tc.ApplicationLayer(0).AdvSQLAddr(),
-				"TestClientDisconnect-testuser", url.User("testuser"))
+			pgURL, cleanup := tc.ApplicationLayer(0).PGUrl(t,
+				serverutils.CertsDirPrefix("TestClientDisconnect-testuser"), serverutils.User("testuser"),
+			)
 			defer cleanup()
 
 			// Kick off the job on a new connection which we're going to close.
@@ -8454,7 +8458,7 @@ func TestRestoringAcrossVersions(t *testing.T) {
 		// Bump the version down to outside our MinBinarySupportedVersion, and write
 		// it back out. This makes it ineligible for restore because of our restore
 		// version policy.
-		minSupportedVersion := tc.ApplicationLayer(0).ClusterSettings().Version.BinaryMinSupportedVersion()
+		minSupportedVersion := tc.ApplicationLayer(0).ClusterSettings().Version.MinSupportedVersion()
 		minSupportedVersion.Major -= 1
 		setManifestClusterVersion(minSupportedVersion)
 
@@ -8468,8 +8472,8 @@ func TestRestoringAcrossVersions(t *testing.T) {
 		// Bump the version down to the min supported binary version, and write it
 		// back out. This makes it eligible for restore because of our restore
 		// version policy.
-		minBinaryVersion := tc.ApplicationLayer(0).ClusterSettings().Version.BinaryMinSupportedVersion()
-		setManifestClusterVersion(minBinaryVersion)
+		minSupportedVersion := tc.ApplicationLayer(0).ClusterSettings().Version.MinSupportedVersion()
+		setManifestClusterVersion(minSupportedVersion)
 		sqlDB.Exec(t, `RESTORE DATABASE r1 FROM 'nodelocal://1/cross_version'`)
 		sqlDB.Exec(t, `DROP DATABASE r1`)
 	})

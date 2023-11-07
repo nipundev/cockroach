@@ -71,7 +71,7 @@ var (
 //
 // The input files use the following DSL:
 //
-// run            [ok|trace|stats|error]
+// run            [ok|trace|stats|error|log-ops]
 //
 // txn_begin      t=<name> [ts=<int>[,<int>]] [globalUncertaintyLimit=<int>[,<int>]]
 // txn_remove     t=<name>
@@ -471,11 +471,13 @@ func TestMVCCHistories(t *testing.T) {
 				// Options:
 				// - trace: emit intermediate results after each operation.
 				// - stats: emit MVCC statistics for each operation and at the end.
+				// - log-ops: emit any MVCC Logical operations at the end.
 				// - error: expect an error to occur. The specific error type/ message
 				//   to expect is spelled out in the expected output.
 				//
 				trace := e.hasArg("trace")
 				stats := e.hasArg("stats")
+				logOps := e.hasArg("log-ops")
 				expectError := e.hasArg("error")
 
 				// buf will accumulate the actual output, which the
@@ -484,6 +486,9 @@ func TestMVCCHistories(t *testing.T) {
 				var buf redact.StringBuilder
 				e.results.buf = &buf
 				e.results.traceClearKey = trace
+
+				e.logOps = logOps
+				e.opLog = nil
 
 				// We reset the stats such that they accumulate for all commands
 				// in a single test.
@@ -548,6 +553,21 @@ func TestMVCCHistories(t *testing.T) {
 							} else {
 								buf.Printf("error reading locks: (%T:) %v\n", err, err)
 							}
+						}
+					}
+					if logOps {
+						prettyPrintOp := func(op enginepb.MVCCLogicalOp) string {
+							switch t := op.GetValue().(type) {
+							case *enginepb.MVCCWriteValueOp:
+								return fmt.Sprintf("write_value: key=%s, ts=%s", roachpb.Key(t.Key), t.Timestamp)
+							case *enginepb.MVCCDeleteRangeOp:
+								return fmt.Sprintf("delete_range: startKey=%s endKey=%s ts=%s", roachpb.Key(t.StartKey), roachpb.Key(t.EndKey), t.Timestamp)
+							default:
+								return fmt.Sprintf("%T", t)
+							}
+						}
+						for _, op := range e.opLog {
+							buf.Printf("logical op: %s\n", prettyPrintOp(op))
 						}
 					}
 				}
@@ -1260,8 +1280,12 @@ func cmdCPut(e *evalCtx) error {
 			ReplayWriteTimestampProtection: e.getAmbiguousReplay(),
 			MaxLockConflicts:               e.getMaxLockConflicts(),
 		}
-		if err := storage.MVCCConditionalPut(e.ctx, rw, key, ts, val, expVal, behavior, opts); err != nil {
+		acq, err := storage.MVCCConditionalPut(e.ctx, rw, key, ts, val, expVal, behavior, opts)
+		if err != nil {
 			return err
+		}
+		if !acq.Empty() {
+			e.results.buf.Printf("cput: lock acquisition = %v\n", acq)
 		}
 		if resolve {
 			return e.resolveIntent(rw, key, txn, resolveStatus, hlc.ClockTimestamp{}, 0)
@@ -1288,8 +1312,12 @@ func cmdInitPut(e *evalCtx) error {
 			ReplayWriteTimestampProtection: e.getAmbiguousReplay(),
 			MaxLockConflicts:               e.getMaxLockConflicts(),
 		}
-		if err := storage.MVCCInitPut(e.ctx, rw, key, ts, val, failOnTombstones, opts); err != nil {
+		acq, err := storage.MVCCInitPut(e.ctx, rw, key, ts, val, failOnTombstones, opts)
+		if err != nil {
 			return err
+		}
+		if !acq.Empty() {
+			e.results.buf.Printf("initput: lock acquisition = %v\n", acq)
 		}
 		if resolve {
 			return e.resolveIntent(rw, key, txn, resolveStatus, hlc.ClockTimestamp{}, 0)
@@ -1312,7 +1340,7 @@ func cmdDelete(e *evalCtx) error {
 			ReplayWriteTimestampProtection: e.getAmbiguousReplay(),
 			MaxLockConflicts:               e.getMaxLockConflicts(),
 		}
-		foundKey, err := storage.MVCCDelete(e.ctx, rw, key, ts, opts)
+		foundKey, acq, err := storage.MVCCDelete(e.ctx, rw, key, ts, opts)
 		if err == nil || errors.HasType(err, &kvpb.WriteTooOldError{}) {
 			// We want to output foundKey even if a WriteTooOldError is returned,
 			// since the error may be swallowed/deferred during evaluation.
@@ -1320,6 +1348,9 @@ func cmdDelete(e *evalCtx) error {
 		}
 		if err != nil {
 			return err
+		}
+		if !acq.Empty() {
+			e.results.buf.Printf("del: lock acquisition = %v\n", acq)
 		}
 		if resolve {
 			return e.resolveIntent(rw, key, txn, resolveStatus, hlc.ClockTimestamp{}, 0)
@@ -1348,10 +1379,13 @@ func cmdDeleteRange(e *evalCtx) error {
 			ReplayWriteTimestampProtection: e.getAmbiguousReplay(),
 			MaxLockConflicts:               e.getMaxLockConflicts(),
 		}
-		deleted, resumeSpan, num, err := storage.MVCCDeleteRange(
+		deleted, resumeSpan, num, acqs, err := storage.MVCCDeleteRange(
 			e.ctx, rw, key, endKey, int64(max), ts, opts, returnKeys)
 		if err != nil {
 			return err
+		}
+		if len(acqs) != 0 {
+			e.results.buf.Printf("del_range: lock acquisitions = %v\n", acqs)
 		}
 		e.results.buf.Printf("del_range: %v-%v -> deleted %d key(s)\n", key, endKey, num)
 		for _, key := range deleted {
@@ -1511,11 +1545,14 @@ func cmdIncrement(e *evalCtx) error {
 			ReplayWriteTimestampProtection: e.getAmbiguousReplay(),
 			MaxLockConflicts:               e.getMaxLockConflicts(),
 		}
-		curVal, err := storage.MVCCIncrement(e.ctx, rw, key, ts, opts, inc)
+		curVal, acq, err := storage.MVCCIncrement(e.ctx, rw, key, ts, opts, inc)
 		if err != nil {
 			return err
 		}
 		e.results.buf.Printf("inc: current value = %d\n", curVal)
+		if !acq.Empty() {
+			e.results.buf.Printf("inc: lock acquisition = %v\n", acq)
+		}
 		if resolve {
 			return e.resolveIntent(rw, key, txn, resolveStatus, hlc.ClockTimestamp{}, 0)
 		}
@@ -1554,8 +1591,12 @@ func cmdPut(e *evalCtx) error {
 			ReplayWriteTimestampProtection: e.getAmbiguousReplay(),
 			MaxLockConflicts:               e.getMaxLockConflicts(),
 		}
-		if err := storage.MVCCPut(e.ctx, rw, key, ts, val, opts); err != nil {
+		acq, err := storage.MVCCPut(e.ctx, rw, key, ts, val, opts)
+		if err != nil {
 			return err
+		}
+		if !acq.Empty() {
+			e.results.buf.Printf("put: lock acquisition = %v\n", acq)
 		}
 		if resolve {
 			return e.resolveIntent(rw, key, txn, resolveStatus, hlc.ClockTimestamp{}, 0)
@@ -2378,6 +2419,9 @@ type evalCtx struct {
 	sstWriter         *storage.SSTWriter
 	sstFile           *storage.MemObject
 	ssts              [][]byte
+
+	logOps bool
+	opLog  []enginepb.MVCCLogicalOp
 }
 
 func newEvalCtx(ctx context.Context, engine storage.Engine) *evalCtx {
@@ -2532,10 +2576,29 @@ func (e *evalCtx) withReader(fn func(storage.Reader) error) error {
 	return fn(r)
 }
 
+type opLoggerWriter struct {
+	storage.ReadWriter
+
+	// TODO(ssd): I reused OpLoggerBatch here to avoid having two
+	// implementations of the operation handling. We can't use
+	// OpLoggerBatch directly because we don't always have a
+	// batch. We could modify OpLoggerBatch so it was usable in
+	// any case without a wrapper, but I didn't want to add
+	// conditionals or indirection into the production path just
+	// for testing.
+	logger *storage.OpLoggerBatch
+}
+
+func (ol *opLoggerWriter) LogLogicalOp(
+	op storage.MVCCLogicalOpType, details storage.MVCCLogicalOpDetails,
+) {
+	ol.logger.LogLogicalOpOnly(op, details)
+}
+
 // withWriter calls the given closure with a writer. The writer is
 // metamorphically chosen to be a batch, which will be committed and closed when
 // done.
-func (e *evalCtx) withWriter(cmd string, fn func(_ storage.ReadWriter) error) error {
+func (e *evalCtx) withWriter(cmd string, fn func(storage.ReadWriter) error) error {
 	var rw storage.ReadWriter
 	rw = e.engine
 	var batch storage.Batch
@@ -2544,7 +2607,17 @@ func (e *evalCtx) withWriter(cmd string, fn func(_ storage.ReadWriter) error) er
 		defer batch.Close()
 		rw = batch
 	}
+
+	opLogger := &storage.OpLoggerBatch{}
+	if e.logOps {
+		rw = &opLoggerWriter{
+			ReadWriter: rw,
+			logger:     opLogger,
+		}
+	}
+
 	rw = e.tryWrapForClearKeyPrinting(rw)
+
 	err := fn(rw)
 	if e.hasArg("batched") {
 		batchStatus := "non-empty"
@@ -2561,6 +2634,9 @@ func (e *evalCtx) withWriter(cmd string, fn func(_ storage.ReadWriter) error) er
 				return err
 			}
 		}
+	}
+	if e.logOps {
+		e.opLog = append(e.opLog, opLogger.LogicalOps()...)
 	}
 	return err
 }

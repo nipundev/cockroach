@@ -101,7 +101,7 @@ func startDistIngestion(
 
 	err = ingestionJob.NoTxn().Update(ctx, func(txn isql.Txn, md jobs.JobMetadata, ju *jobs.JobUpdater) error {
 		// Persist the initial Stream Addresses to the jobs table before execution begins.
-		if !planner.containsInitialStreamAddresses() {
+		if len(planner.initialStreamAddresses) == 0 {
 			return jobs.MarkAsPermanentJobError(errors.AssertionFailedf(
 				"attempted to persist an empty list of stream addresses"))
 		}
@@ -113,7 +113,7 @@ func startDistIngestion(
 		return errors.Wrap(err, "failed to update job progress")
 	}
 	jobsprofiler.StorePlanDiagram(ctx, execCtx.ExecCfg().DistSQLSrv.Stopper, planner.initialPlan, execCtx.ExecCfg().InternalDB,
-		ingestionJob.ID())
+		ingestionJob.ID(), execCtx.ExecCfg().Settings.Version)
 
 	replanOracle := sql.ReplanOnCustomFunc(
 		measurePlanChange,
@@ -383,6 +383,11 @@ type replicationFlowPlanner struct {
 	// generatePlan generates a c2c physical plan.
 	generatePlan func(ctx context.Context, dsp *sql.DistSQLPlanner) (*sql.PhysicalPlan, *sql.PlanningCtx, error)
 
+	// initialPlan contains the physical plan that actually gets executed.
+	// makeReplicationFlowPlanner will generate the initialPlan, and thereafter,
+	// only the replanner will call generatePlan to consider alternative
+	// candidates. If the replanner prefers an alternative plan, the whole distsql
+	// flow is shut down and a new initial plan will be created.
 	initialPlan *sql.PhysicalPlan
 
 	initialPlanCtx *sql.PlanningCtx
@@ -393,8 +398,8 @@ type replicationFlowPlanner struct {
 	srcTenantID roachpb.TenantID
 }
 
-func (p *replicationFlowPlanner) containsInitialStreamAddresses() bool {
-	return len(p.initialStreamAddresses) > 0
+func (p *replicationFlowPlanner) createdInitialPlan() bool {
+	return p.initialPlan != nil
 }
 
 func (p *replicationFlowPlanner) getSrcTenantID() (roachpb.TenantID, error) {
@@ -421,7 +426,7 @@ func (p *replicationFlowPlanner) constructPlanGenerator(
 		if err != nil {
 			return nil, nil, err
 		}
-		if !p.containsInitialStreamAddresses() {
+		if !p.createdInitialPlan() {
 			p.initialTopology = topology
 			p.initialStreamAddresses = topology.StreamAddresses()
 		}
@@ -455,8 +460,12 @@ func (p *replicationFlowPlanner) constructPlanGenerator(
 		if knobs := execCtx.ExecCfg().StreamingTestingKnobs; knobs != nil && knobs.AfterReplicationFlowPlan != nil {
 			knobs.AfterReplicationFlowPlan(streamIngestionSpecs, streamIngestionFrontierSpec)
 		}
-		if err := persistStreamIngestionPartitionSpecs(ctx, execCtx.ExecCfg(), ingestionJobID, streamIngestionSpecs); err != nil {
-			return nil, nil, err
+		if !p.createdInitialPlan() {
+			// Only persist the initial plan as it's the only plan that actually gets
+			// executed.
+			if err := persistStreamIngestionPartitionSpecs(ctx, execCtx.ExecCfg(), ingestionJobID, streamIngestionSpecs, execCtx.ExecCfg().Settings.Version); err != nil {
+				return nil, nil, err
+			}
 		}
 
 		// Setup a one-stage plan with one proc per input spec.

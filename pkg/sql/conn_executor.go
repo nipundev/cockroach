@@ -28,6 +28,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/isolation"
 	"github.com/cockroachdb/cockroach/pkg/multitenant"
 	"github.com/cockroachdb/cockroach/pkg/multitenant/multitenantcpu"
+	"github.com/cockroachdb/cockroach/pkg/obs"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
@@ -408,7 +409,9 @@ type ServerMetrics struct {
 
 // NewServer creates a new Server. Start() needs to be called before the Server
 // is used.
-func NewServer(cfg *ExecutorConfig, pool *mon.BytesMonitor) *Server {
+func NewServer(
+	cfg *ExecutorConfig, pool *mon.BytesMonitor, eventsExporter obs.EventsExporterInterface,
+) *Server {
 	metrics := makeMetrics(false /* internal */)
 	serverMetrics := makeServerMetrics(cfg)
 	insightsProvider := insights.New(cfg.Settings, serverMetrics.InsightsMetrics)
@@ -477,7 +480,7 @@ func NewServer(cfg *ExecutorConfig, pool *mon.BytesMonitor) *Server {
 		FlushCounter:   serverMetrics.StatsMetrics.SQLStatsFlushStarted,
 		FailureCounter: serverMetrics.StatsMetrics.SQLStatsFlushFailure,
 		FlushDuration:  serverMetrics.StatsMetrics.SQLStatsFlushDuration,
-	}, memSQLStats)
+	}, memSQLStats, eventsExporter)
 
 	s.sqlStats = persistedSQLStats
 	s.sqlStatsController = persistedSQLStats.GetController(cfg.SQLStatusServer)
@@ -3416,22 +3419,22 @@ func (ex *connExecutor) setTransactionModes(
 	return ex.state.setReadOnlyMode(rwMode)
 }
 
-var allowSnapshotIsolation = settings.RegisterBoolSetting(
-	settings.ApplicationLevel,
-	"sql.txn.snapshot_isolation_syntax.enabled",
-	"set to true to allow transactions to use the SNAPSHOT isolation level. At "+
-		"the time of writing, this setting is intended only for usage by "+
-		"CockroachDB developers.",
-	false,
-)
-
 var allowReadCommittedIsolation = settings.RegisterBoolSetting(
 	settings.ApplicationLevel,
-	"sql.txn.read_committed_syntax.enabled",
+	"sql.txn.read_committed_isolation.enabled",
 	"set to true to allow transactions to use the READ COMMITTED isolation "+
 		"level if specified by BEGIN/SET commands",
 	false,
 	settings.WithPublic,
+)
+
+var allowSnapshotIsolation = settings.RegisterBoolSetting(
+	settings.ApplicationLevel,
+	"sql.txn.snapshot_isolation.enabled",
+	"set to true to allow transactions to use the SNAPSHOT isolation level. At "+
+		"the time of writing, this setting is intended only for usage by "+
+		"CockroachDB developers.",
+	false,
 )
 
 func (ex *connExecutor) txnIsolationLevelToKV(

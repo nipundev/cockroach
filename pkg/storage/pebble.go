@@ -600,23 +600,18 @@ const MinimumSupportedFormatVersion = pebble.FormatPrePebblev1Marked
 
 // DefaultPebbleOptions returns the default pebble options.
 func DefaultPebbleOptions() *pebble.Options {
-	// In RocksDB, the concurrency setting corresponds to both flushes and
-	// compactions. In Pebble, there is always a slot for a flush, and
-	// compactions are counted separately.
-	maxConcurrentCompactions := rocksdbConcurrency - 1
-	if maxConcurrentCompactions < 1 {
-		maxConcurrentCompactions = 1
-	}
-
 	opts := &pebble.Options{
 		Comparer: EngineComparer,
 		FS:       vfs.Default,
 		// A value of 2 triggers a compaction when there is 1 sub-level.
-		L0CompactionThreshold:       2,
-		L0StopWritesThreshold:       1000,
-		LBaseMaxBytes:               64 << 20, // 64 MB
-		Levels:                      make([]pebble.LevelOptions, 7),
-		MaxConcurrentCompactions:    func() int { return maxConcurrentCompactions },
+		L0CompactionThreshold: 2,
+		L0StopWritesThreshold: 1000,
+		LBaseMaxBytes:         64 << 20, // 64 MB
+		Levels:                make([]pebble.LevelOptions, 7),
+		// NB: Options.MaxConcurrentCompactions may be overidden in NewPebble to
+		// allow overriding the max at runtime through
+		// Engine.SetCompactionConcurrency.
+		MaxConcurrentCompactions:    getMaxConcurrentCompactions,
 		MemTableSize:                64 << 20, // 64 MB
 		MemTableStopWritesThreshold: 4,
 		Merger:                      MVCCMerger,
@@ -741,6 +736,10 @@ func (l pebbleLogger) Eventf(ctx context.Context, format string, args ...interfa
 
 func (l pebbleLogger) IsTracingEnabled(ctx context.Context) bool {
 	return log.HasSpanOrEvent(ctx)
+}
+
+func (l pebbleLogger) Errorf(format string, args ...interface{}) {
+	log.Storage.ErrorfDepth(l.ctx, l.depth, format, args...)
 }
 
 // PebbleConfig holds all configuration parameters and knobs used in setting up
@@ -1233,18 +1232,18 @@ func NewPebble(ctx context.Context, cfg PebbleConfig) (p *Pebble, err error) {
 		// sequence (so now some stores have v21.2, but others v22.1) you are
 		// expected to run v22.1 again (hopefully without the crash this time) which
 		// would then rewrite all the stores.
-		if v := cfg.Settings.Version; storeClusterVersion.Less(v.BinaryMinSupportedVersion()) {
-			if storeClusterVersion.Major < clusterversion.DevOffset && v.BinaryVersion().Major >= clusterversion.DevOffset {
+		if v := cfg.Settings.Version; storeClusterVersion.Less(v.MinSupportedVersion()) {
+			if storeClusterVersion.Major < clusterversion.DevOffset && v.LatestVersion().Major >= clusterversion.DevOffset {
 				return nil, errors.Errorf(
 					"store last used with cockroach non-development version v%s "+
 						"cannot be opened by development version v%s",
-					storeClusterVersion, v.BinaryVersion(),
+					storeClusterVersion, v.LatestVersion(),
 				)
 			}
 			return nil, errors.Errorf(
 				"store last used with cockroach version v%s "+
 					"is too old for running version v%s (which requires data from v%s or later)",
-				storeClusterVersion, v.BinaryVersion(), v.BinaryMinSupportedVersion(),
+				storeClusterVersion, v.LatestVersion(), v.MinSupportedVersion(),
 			)
 		}
 		opts.ErrorIfNotExists = true
@@ -1289,7 +1288,7 @@ func NewPebble(ctx context.Context, cfg PebbleConfig) (p *Pebble, err error) {
 		storeClusterVersion = cfg.Settings.Version.ActiveVersionOrEmpty(ctx).Version
 		if storeClusterVersion == (roachpb.Version{}) {
 			// If there is no active version, use the minimum supported version.
-			storeClusterVersion = cfg.Settings.Version.BinaryMinSupportedVersion()
+			storeClusterVersion = cfg.Settings.Version.MinSupportedVersion()
 		}
 	}
 
@@ -1335,12 +1334,12 @@ func (p *Pebble) writePreventStartupFile(ctx context.Context, corruptionError er
 
 	preventStartupMsg := fmt.Sprintf(`ATTENTION:
 
-  this node is terminating because of sstable corruption. 
-	Corruption may be a consequence of a hardware error. 
+  this node is terminating because of sstable corruption.
+	Corruption may be a consequence of a hardware error.
 
-	Error: %s 
+	Error: %s
 
-  A file preventing this node from restarting was placed at: 
+  A file preventing this node from restarting was placed at:
   %s`, corruptionError.Error(), path)
 
 	if err := fs.WriteFile(p.unencryptedFS, path, []byte(preventStartupMsg)); err != nil {

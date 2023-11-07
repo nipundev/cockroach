@@ -1339,6 +1339,7 @@ func (sc *StoreConfig) SetDefaults(numStores int) {
 			sc.TestingKnobs.AllocatorKnobs = &allocator.TestingKnobs{}
 		}
 		sc.TestingKnobs.AllocatorKnobs.AllowLeaseTransfersToReplicasNeedingSnapshots = true
+		sc.TestingKnobs.ReplicaPlannerKnobs.AllowVoterRemovalWhenNotLeader = true // downreplication
 	}
 	if raftDisableQuiescence {
 		sc.TestingKnobs.DisableQuiescence = true
@@ -2449,6 +2450,9 @@ func (s *Store) startRangefeedTxnPushNotifier(ctx context.Context) {
 		for {
 			select {
 			case <-ticker.C:
+				if !rangefeed.PushTxnsEnabled.Get(&s.ClusterSettings().SV) {
+					continue
+				}
 				batch := makeSchedulerBatch()
 				s.rangefeedScheduler.EnqueueBatch(batch, rangefeed.PushTxnQueued)
 				batch.Close()

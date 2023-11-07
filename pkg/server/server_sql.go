@@ -520,7 +520,7 @@ func (r *refreshInstanceSessionListener) OnSessionDeleted(
 				r.cfg.AdvertiseAddr,
 				r.cfg.SQLAdvertiseAddr,
 				r.cfg.Locality,
-				r.cfg.Settings.Version.BinaryVersion(),
+				r.cfg.Settings.Version.LatestVersion(),
 				nodeID,
 			); err != nil {
 				log.Warningf(ctx, "failed to update instance with new session ID: %v", err)
@@ -1145,6 +1145,7 @@ func newSQLServer(ctx context.Context, cfg sqlServerArgs) (*SQLServer, error) {
 		sqlMemMetrics,
 		rootSQLMemoryMonitor,
 		cfg.HistogramWindowInterval(),
+		cfg.eventsExporter,
 		execCfg,
 	)
 
@@ -1510,7 +1511,7 @@ func (s *SQLServer) preStart(
 					s.cfg.AdvertiseAddr,
 					s.cfg.SQLAdvertiseAddr,
 					s.distSQLServer.Locality,
-					s.execCfg.Settings.Version.BinaryVersion(),
+					s.execCfg.Settings.Version.LatestVersion(),
 					nodeID,
 				)
 			}
@@ -1521,7 +1522,7 @@ func (s *SQLServer) preStart(
 				s.cfg.AdvertiseAddr,
 				s.cfg.SQLAdvertiseAddr,
 				s.distSQLServer.Locality,
-				s.execCfg.Settings.Version.BinaryVersion(),
+				s.execCfg.Settings.Version.LatestVersion(),
 			)
 		})
 	if err != nil {
@@ -1659,20 +1660,20 @@ func (s *SQLServer) preStart(
 		}); err != nil {
 		return err
 	}
-	if s.execCfg.Settings.Version.BinaryVersion().Less(tenantActiveVersion.Version) {
+	if s.execCfg.Settings.Version.LatestVersion().Less(tenantActiveVersion.Version) {
 		return errors.WithHintf(errors.Newf("preventing SQL server from starting because its binary version "+
 			"is too low for the tenant active version: server binary version = %v, tenant active version = %v",
-			s.execCfg.Settings.Version.BinaryVersion(), tenantActiveVersion.Version),
+			s.execCfg.Settings.Version.LatestVersion(), tenantActiveVersion.Version),
 			"use a tenant binary whose version is at least %v", tenantActiveVersion.Version)
 	}
 
 	// Prevent the server from starting if its minimum supported binary version is too high
 	// for the tenant cluster version.
-	if tenantActiveVersion.Version.Less(s.execCfg.Settings.Version.BinaryMinSupportedVersion()) {
+	if tenantActiveVersion.Version.Less(s.execCfg.Settings.Version.MinSupportedVersion()) {
 		return errors.WithHintf(errors.Newf("preventing SQL server from starting because its executable "+
 			"version is too new to run the current active logical version of the virtual cluster"),
 			"finalize the virtual cluster version to at least %v or downgrade the"+
-				"executable version to at most %v", s.execCfg.Settings.Version.BinaryMinSupportedVersion(), tenantActiveVersion.Version,
+				"executable version to at most %v", s.execCfg.Settings.Version.MinSupportedVersion(), tenantActiveVersion.Version,
 		)
 	}
 
@@ -1743,7 +1744,53 @@ func (s *SQLServer) preStart(
 		}
 	}
 
+	s.waitForActiveAutoConfigEnvironments(ctx)
+
 	return nil
+}
+
+// waitForActiveAutoConfigEnvironments waits until the set of
+// ActiveEnvironments is empty. ActiveEnvironments is empty once there
+// are no more tasks to run.
+//
+// This is sufficient to ensure all configuration task jobs have
+// completed becuase the environment runner only enqueues a task after
+// the previous task has completed and configuration profiles include
+// an "end task" that runs after all previous tasks.
+func (s *SQLServer) waitForActiveAutoConfigEnvironments(ctx context.Context) {
+	maxWait := 2 * time.Minute
+	serverKnobs := s.cfg.TestingKnobs.Server
+	if serverKnobs != nil && serverKnobs.(*TestingKnobs).AutoConfigProfileStartupWaitTime != nil {
+		maxWait = *serverKnobs.(*TestingKnobs).AutoConfigProfileStartupWaitTime
+	}
+
+	if maxWait == 0 {
+		log.Infof(ctx, "waiting for auto-configuration environments disabled")
+		return
+	}
+
+	envs := s.execCfg.AutoConfigProvider.ActiveEnvironments()
+	if len(envs) == 0 {
+		log.Infof(ctx, "auto-configuration environments not set or already complete")
+		return
+	}
+
+	log.Infof(ctx, "waiting up to %s for auto-configuration environments %v to complete", maxWait, envs)
+	ctx, cancel := context.WithTimeout(ctx, maxWait) // nolint:context
+	defer cancel()
+	retryCfg := retry.Options{
+		InitialBackoff: 100 * time.Millisecond,
+		MaxBackoff:     5 * time.Second,
+	}
+	waitStart := timeutil.Now()
+	for i := retry.StartWithCtx(ctx, retryCfg); i.Next(); {
+		envs := s.execCfg.AutoConfigProvider.ActiveEnvironments()
+		if len(envs) == 0 {
+			log.Infof(ctx, "auto-configuration environments reported no active tasks after %s", timeutil.Since(waitStart))
+			return
+		}
+	}
+	log.Warningf(ctx, "auto-configuration environments still running after %s, moving on", timeutil.Since(waitStart))
 }
 
 // startCheckService verifies that the tenant has the right

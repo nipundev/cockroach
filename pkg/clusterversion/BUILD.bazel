@@ -7,7 +7,7 @@ go_library(
     srcs = [
         "clusterversion.go",
         "cockroach_versions.go",
-        "keyed_versions.go",
+        "dev_offset.go",
         "setting.go",
         "testutils.go",
         "utilversions.go",
@@ -16,6 +16,7 @@ go_library(
     importpath = "github.com/cockroachdb/cockroach/pkg/clusterversion",
     visibility = ["//visibility:public"],
     deps = [
+        "//pkg/build",
         "//pkg/roachpb",
         "//pkg/settings",
         "//pkg/util/envutil",
@@ -25,7 +26,6 @@ go_library(
         "//pkg/util/timeutil",
         "@com_github_cockroachdb_errors//:errors",
         "@com_github_cockroachdb_redact//:redact",
-        "@com_github_kr_pretty//:pretty",
     ],
 )
 
@@ -40,6 +40,7 @@ go_test(
     args = ["-test.timeout=55s"],
     embed = [":clusterversion"],
     deps = [
+        "//pkg/build",
         "//pkg/roachpb",
         "//pkg/settings",
         "//pkg/settings/cluster",
@@ -48,7 +49,6 @@ go_test(
         "//pkg/util/protoutil",
         "@com_github_cockroachdb_errors//:errors",
         "@com_github_cockroachdb_redact//:redact",
-        "@com_github_dustin_go_humanize//:go-humanize",
         "@com_github_stretchr_testify//require",
     ],
 )

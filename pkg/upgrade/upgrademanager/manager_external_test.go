@@ -165,7 +165,7 @@ func TestAlreadyRunningJobsAreHandledProperly(t *testing.T) {
 RETURNING id;`, firstID).Scan(&secondID))
 	// Insert the job payload and progress into the `system.job_info` table.
 	err := tc.Server(0).InternalDB().(isql.DB).Txn(ctx, func(ctx context.Context, txn isql.Txn) error {
-		infoStorage := jobs.InfoStorageForJob(txn, secondID)
+		infoStorage := jobs.InfoStorageForJob(txn, secondID, tc.Server(0).ClusterSettings().Version)
 		if err := infoStorage.WriteLegacyPayload(ctx, firstPayload); err != nil {
 			return err
 		}
@@ -465,7 +465,7 @@ func TestConcurrentMigrationAttempts(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	// We're going to be migrating from the BinaryMinSupportedVersion to imaginary future versions.
+	// We're going to be migrating from the MinSupportedVersion to imaginary future versions.
 	current := clusterversion.TestingBinaryMinSupportedVersion
 	versions := []roachpb.Version{current}
 	for i := int32(1); i <= 4; i++ {

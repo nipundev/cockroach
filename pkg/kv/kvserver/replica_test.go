@@ -177,7 +177,7 @@ func (tc *testContext) Start(ctx context.Context, t testing.TB, stopper *stop.St
 func (tc *testContext) StartWithStoreConfig(
 	ctx context.Context, t testing.TB, stopper *stop.Stopper, cfg StoreConfig,
 ) {
-	tc.StartWithStoreConfigAndVersion(ctx, t, stopper, cfg, cfg.Settings.Version.BinaryVersion())
+	tc.StartWithStoreConfigAndVersion(ctx, t, stopper, cfg, cfg.Settings.Version.LatestVersion())
 }
 
 // StartWithStoreConfigAndVersion is like StartWithStoreConfig but additionally
@@ -1823,8 +1823,9 @@ func TestOptimizePuts(t *testing.T) {
 			require.NoError(t, storage.MVCCDeleteRangeUsingTombstone(ctx, tc.engine, nil,
 				c.exKey, c.exEndKey, hlc.MinTimestamp, hlc.ClockTimestamp{}, nil, nil, false, 0, nil))
 		} else if c.exKey != nil {
-			require.NoError(t, storage.MVCCPut(ctx, tc.engine, c.exKey,
-				hlc.Timestamp{}, roachpb.MakeValueFromString("foo"), storage.MVCCWriteOptions{}))
+			_, err := storage.MVCCPut(ctx, tc.engine, c.exKey,
+				hlc.Timestamp{}, roachpb.MakeValueFromString("foo"), storage.MVCCWriteOptions{})
+			require.NoError(t, err)
 		}
 		batch := kvpb.BatchRequest{}
 		for _, r := range c.reqs {
@@ -3535,7 +3536,7 @@ func TestReplicaAbortSpanReadError(t *testing.T) {
 
 	// Overwrite Abort span entry with garbage for the last op.
 	key := keys.AbortSpanKey(tc.repl.RangeID, txn.ID)
-	err := storage.MVCCPut(ctx, tc.engine, key, hlc.Timestamp{}, roachpb.MakeValueFromString("never read in this test"), storage.MVCCWriteOptions{})
+	_, err := storage.MVCCPut(ctx, tc.engine, key, hlc.Timestamp{}, roachpb.MakeValueFromString("never read in this test"), storage.MVCCWriteOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -11072,7 +11073,7 @@ func TestReplicaPushed1PC(t *testing.T) {
 	// Write a value outside the transaction.
 	tc.manualClock.Advance(10)
 	ts2 := tc.Clock().Now()
-	if err := storage.MVCCPut(ctx, tc.engine, k, ts2, roachpb.MakeValueFromString("one"), storage.MVCCWriteOptions{}); err != nil {
+	if _, err := storage.MVCCPut(ctx, tc.engine, k, ts2, roachpb.MakeValueFromString("one"), storage.MVCCWriteOptions{}); err != nil {
 		t.Fatalf("writing interfering value: %+v", err)
 	}
 
@@ -13585,7 +13586,8 @@ func setMockPutWithEstimates(containsEstimatesDelta int64) (undo func()) {
 		opts := storage.MVCCWriteOptions{Txn: cArgs.Header.Txn, Stats: cArgs.Stats}
 		opts.Stats.ContainsEstimates += containsEstimatesDelta
 		ts := cArgs.Header.Timestamp
-		return result.Result{}, storage.MVCCBlindPut(ctx, readWriter, args.Key, ts, args.Value, opts)
+		_, err := storage.MVCCBlindPut(ctx, readWriter, args.Key, ts, args.Value, opts)
+		return result.Result{}, err
 	}
 
 	batcheval.UnregisterCommand(kvpb.Put)
@@ -14653,4 +14655,105 @@ func TestEndTxnReplicatedLocksBumpsTSCache(t *testing.T) {
 			}
 		})
 	})
+}
+
+// TestReplayWithBumpedTimestamp serves as a regression test for the bug
+// identified in https://github.com/cockroachdb/cockroach/pull/113295. It
+// ensures that a replay with a bumped timestamp does not incorrectly
+// communicate the timestamp at which the intent was actually written -- doing
+// so can lead to infinite lock discovery cycles, as illustrated in the linked
+// issue.
+func TestReplayWithBumpedTimestamp(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	ctx := context.Background()
+	tc := testContext{}
+	stopper := stop.NewStopper()
+	defer stopper.Stop(ctx)
+	startTime := timeutil.Unix(0, 123)
+	tc.manualClock = timeutil.NewManualTime(startTime)
+	sc := TestStoreConfig(hlc.NewClockForTesting(tc.manualClock))
+	sc.TestingKnobs.DisableCanAckBeforeApplication = true
+	tc.StartWithStoreConfig(ctx, t, stopper, sc)
+
+	// We'll issue a put from txn1 at ts0.
+	k := roachpb.Key("a")
+	t0 := timeutil.Unix(1, 0)
+	tc.manualClock.MustAdvanceTo(t0)
+	txn1 := roachpb.MakeTransaction(
+		"t1", k, isolation.Serializable, roachpb.NormalUserPriority, makeTS(t0.UnixNano(), 0), 0, 0, 0,
+	)
+	pArgs := putArgs(k, []byte("value"))
+	ba := &kvpb.BatchRequest{}
+	ba.Txn = &txn1
+	ba.Add(&pArgs)
+	_, pErr := tc.Sender().Send(ctx, ba)
+	require.Nil(t, pErr)
+
+	// Sanity check the number of locks in the lock table is expected; we'll then
+	// build on this precondition below.
+	if tc.repl.concMgr.LockTableMetrics().Locks != 0 {
+		t.Fatal("unexpected number of locks")
+	}
+
+	// Un-contended replicated locks are dropped by the lock table (as evidenced
+	// by the pre-condition above). We need the replicated lock to be tracked to
+	// reconstruct the hazard described in
+	// https://github.com/cockroachdb/cockroach/pull/113295. We do so by adding a
+	// non-locking waiter for this key which will discover and pull the lock into
+	// the lock table. Note that we do so before replaying the put at a higher
+	// timestamp.
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+
+		err := tc.store.DB().Txn(ctx, func(ctxt context.Context, txn *kv.Txn) error {
+			_, err := txn.Get(ctx, k)
+			return err
+		})
+		if err != nil {
+			t.Errorf(err.Error())
+		}
+	}()
+
+	testutils.SucceedsSoon(t, func() error {
+		if tc.repl.concMgr.LockTableMetrics().Locks != 1 {
+			return errors.New("waiting for lock to be pulled into the lock table")
+		}
+		return nil
+	})
+
+	// Replay the same put at a higher timestamp.
+	t2 := timeutil.Unix(3, 0)
+	txn1.WriteTimestamp = makeTS(t2.UnixNano(), 0)
+	_, pErr = tc.Sender().Send(ctx, ba)
+	require.Nil(t, pErr, "unexpected error : %v", pErr.GoError())
+
+	// Issue a read request at a timestamp t1, t0 < t1 < t2.
+	t1 := timeutil.Unix(2, 0)
+	tc.manualClock.MustAdvanceTo(t1)
+	// We want to ensure that txn2 doesn't end up in an infinite lock discovery
+	// cycle and is able to push txn1. We set txn2's priority to high to ensure it
+	// can successfully push txn1's timestamp instead of continuing to block
+	// indefinitely.
+	txn2 := roachpb.MakeTransaction(
+		"t2", k, isolation.Serializable, roachpb.MaxUserPriority, makeTS(t1.UnixNano(), 0), 0, 0, 0,
+	)
+	gArgs := getArgs(k)
+	ba = &kvpb.BatchRequest{}
+	ba.Txn = &txn2
+	ba.Add(&gArgs)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+
+		_, pErr = tc.Sender().Send(ctx, ba)
+		if pErr != nil {
+			t.Error(pErr)
+		}
+	}()
+
+	wg.Wait()
 }

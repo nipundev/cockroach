@@ -150,11 +150,11 @@ func runDiskStalledDetection(
 
 	stallAt := timeutil.Now()
 	response := mustGetMetrics(t, adminURL, workloadStartAt, stallAt, []tsQuery{
-		{name: "cr.node.txn.commits", queryType: total},
+		{name: "cr.node.sql.query.count", queryType: total},
 	})
 	cum := response.Results[0].Datapoints
-	totalTxnsPreStall := cum[len(cum)-1].Value - cum[0].Value
-	t.L().PrintfCtx(ctx, "%.2f transactions completed before stall", totalTxnsPreStall)
+	totalQueriesPreStall := cum[len(cum)-1].Value - cum[0].Value
+	t.L().PrintfCtx(ctx, "%.2f queries completed before stall", totalQueriesPreStall)
 
 	t.Status("inducing write stall")
 	if doStall {
@@ -202,16 +202,16 @@ func runDiskStalledDetection(
 	{
 		now := timeutil.Now()
 		response := mustGetMetrics(t, adminURL, workloadStartAt, now, []tsQuery{
-			{name: "cr.node.txn.commits", queryType: total},
+			{name: "cr.node.sql.query.count", queryType: total},
 		})
 		cum := response.Results[0].Datapoints
-		totalTxnsPostStall := cum[len(cum)-1].Value - totalTxnsPreStall
-		preStallTPS := totalTxnsPreStall / stallAt.Sub(workloadStartAt).Seconds()
-		postStallTPS := totalTxnsPostStall / workloadAfterDur.Seconds()
-		t.L().PrintfCtx(ctx, "%.2f total transactions committed after stall\n", totalTxnsPostStall)
-		t.L().PrintfCtx(ctx, "pre-stall tps: %.2f, post-stall tps: %.2f\n", preStallTPS, postStallTPS)
-		if postStallTPS < preStallTPS/2 {
-			t.Fatalf("post-stall TPS %.2f is less than 50%% of pre-stall TPS %.2f", postStallTPS, preStallTPS)
+		totalQueriesPostStall := cum[len(cum)-1].Value - totalQueriesPreStall
+		preStallQPS := totalQueriesPreStall / stallAt.Sub(workloadStartAt).Seconds()
+		postStallQPS := totalQueriesPostStall / workloadAfterDur.Seconds()
+		t.L().PrintfCtx(ctx, "%.2f total queries committed after stall\n", totalQueriesPostStall)
+		t.L().PrintfCtx(ctx, "pre-stall qps: %.2f, post-stall qps: %.2f\n", preStallQPS, postStallQPS)
+		if postStallQPS < preStallQPS/2 {
+			t.Fatalf("post-stall QPS %.2f is less than 50%% of pre-stall QPS %.2f", postStallQPS, preStallQPS)
 		}
 	}
 
@@ -296,6 +296,10 @@ func (s *dmsetupDiskStaller) device() string { return getDevice(s.t, s.c) }
 
 func (s *dmsetupDiskStaller) Setup(ctx context.Context) {
 	dev := s.device()
+	// snapd will run "snapd auto-import /dev/dm-0" via udev triggers when
+	// /dev/dm-0 is created. This possibly interferes with the dmsetup create
+	// reload, so uninstall snapd.
+	s.c.Run(ctx, s.c.All(), `sudo apt-get purge -y snapd`)
 	s.c.Run(ctx, s.c.All(), `sudo umount -f /mnt/data1 || true`)
 	s.c.Run(ctx, s.c.All(), `sudo dmsetup remove_all`)
 	err := s.c.RunE(ctx, s.c.All(), `echo "0 $(sudo blockdev --getsz `+dev+`) linear `+dev+` 0" | `+
@@ -314,6 +318,8 @@ func (s *dmsetupDiskStaller) Cleanup(ctx context.Context) {
 	s.c.Run(ctx, s.c.All(), `sudo umount /mnt/data1`)
 	s.c.Run(ctx, s.c.All(), `sudo dmsetup remove_all`)
 	s.c.Run(ctx, s.c.All(), `sudo mount /mnt/data1`)
+	// Reinstall snapd in case subsequent tests need it.
+	s.c.Run(ctx, s.c.All(), `sudo apt-get install -y snapd`)
 }
 
 func (s *dmsetupDiskStaller) Stall(ctx context.Context, nodes option.NodeListOption) {

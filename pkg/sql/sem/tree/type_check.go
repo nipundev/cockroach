@@ -1299,6 +1299,16 @@ func (expr *FuncExpr) TypeCheck(
 		}
 	}
 
+	if overloadImpl.Type == BuiltinRoutine && (def.Name == "min" || def.Name == "max") {
+		// Special case: for REFCURSOR, we disallow min/max during type-checking
+		// despite having overloads for REFCURSOR. This maintains compatibility with
+		// postgres without having to add special checks in optimizer rules for
+		// REFCURSOR.
+		if len(s.typedExprs) > 0 && s.typedExprs[0].ResolvedType().Family() == types.RefCursorFamily {
+			return nil, pgerror.Newf(pgcode.UndefinedFunction, "function %s(refcursor) does not exist", def.Name)
+		}
+	}
+
 	if overloadImpl.Type == ProcedureRoutine && semaCtx.Properties.IsSet(RejectProcedures) {
 		return nil, errors.WithHint(
 			pgerror.Newf(
@@ -1817,7 +1827,7 @@ func (expr *Array) TypeCheck(
 	}
 
 	if len(expr.Exprs) == 0 {
-		if desiredParam.Family() == types.AnyFamily {
+		if desiredParam == types.Any {
 			return nil, errAmbiguousArrayType
 		}
 		expr.typ = types.MakeArray(desiredParam)
@@ -2696,7 +2706,7 @@ func typeCheckSameTypedExprs(
 			return nil, nil, err
 		}
 		typ := typedExpr.ResolvedType()
-		if typ == types.Unknown && desired != types.Any {
+		if typ == types.Unknown && !desired.IsWildcardType() {
 			// The expression had a NULL type, so we can return the desired type as
 			// the expression type.
 			typ = desired
@@ -2779,7 +2789,7 @@ func typeCheckSameTypedExprs(
 				}
 				return typedExprs, typ, nil
 			default:
-				if desired != types.Any {
+				if !desired.IsWildcardType() {
 					return typedExprs, desired, nil
 				}
 				return typedExprs, types.Unknown, nil
@@ -2874,7 +2884,7 @@ func typeCheckSameTypedConsts(
 	}
 
 	// If typ is not a wildcard, all consts try to become typ.
-	if typ.Family() != types.AnyFamily {
+	if !typ.IsWildcardType() {
 		all := true
 		for i, ok := s.constIdxs.Next(0); ok; i, ok = s.constIdxs.Next(i + 1) {
 			if !canConstantBecome(s.exprs[i].(Constant), typ) {
@@ -2913,7 +2923,7 @@ func typeCheckSameTypedConsts(
 		if typ := typedExpr.ResolvedType(); !typ.Equivalent(reqTyp) {
 			return nil, unexpectedTypeError(s.exprs[i], reqTyp, typ)
 		}
-		if reqTyp.Family() == types.AnyFamily {
+		if reqTyp.IsWildcardType() {
 			reqTyp = typedExpr.ResolvedType()
 		}
 	}

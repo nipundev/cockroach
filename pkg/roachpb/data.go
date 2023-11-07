@@ -1990,7 +1990,8 @@ func (l *Lease) Equal(that interface{}) bool {
 }
 
 // MakeLock makes a lock with the given txn, key, and strength.
-// This is suitable for use when constructing LockConflictError.
+// This is suitable for use when constructing a LockConflictError or
+// WriteIntentError.
 func MakeLock(txn *enginepb.TxnMeta, key Key, str lock.Strength) Lock {
 	var l Lock
 	l.Txn = *txn
@@ -2036,15 +2037,24 @@ func AsIntents(txn *enginepb.TxnMeta, keys []Key) []Intent {
 // MakeLockAcquisition makes a lock acquisition message from the given
 // txn, key, durability level, and lock strength.
 func MakeLockAcquisition(
-	txn *Transaction, key Key, dur lock.Durability, str lock.Strength,
+	txn enginepb.TxnMeta,
+	key Key,
+	dur lock.Durability,
+	str lock.Strength,
+	ignoredSeqNums []enginepb.IgnoredSeqNumRange,
 ) LockAcquisition {
 	return LockAcquisition{
 		Span:           Span{Key: key},
-		Txn:            txn.TxnMeta,
+		Txn:            txn,
 		Durability:     dur,
 		Strength:       str,
-		IgnoredSeqNums: txn.IgnoredSeqNums,
+		IgnoredSeqNums: ignoredSeqNums,
 	}
+}
+
+// Empty returns true if the lock acquisition is empty.
+func (m *LockAcquisition) Empty() bool {
+	return m.Span.Equal(Span{})
 }
 
 // MakeLockUpdate makes a lock update from the given txn and span.

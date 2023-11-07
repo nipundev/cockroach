@@ -444,6 +444,12 @@ func (c *transientCluster) Start(ctx context.Context) (err error) {
 
 			ie := c.firstServer.InternalExecutor().(isql.Executor)
 
+			// Grant full capabilities.
+			_, err = ie.Exec(ctx, "tenant-grant-capabilities", nil, fmt.Sprintf("ALTER VIRTUAL CLUSTER %s GRANT ALL CAPABILITIES", demoTenantName))
+			if err != nil {
+				return err
+			}
+
 			if !c.demoCtx.DisableServerController {
 				// Select the default tenant.
 				// Choose the tenant to use when no tenant is specified on a
@@ -818,7 +824,7 @@ func (c *transientCluster) waitForSQLReadiness(
 		case <-ctx.Done():
 			return errors.CombineErrors(errors.Newf("context cancellation while waiting for server %d to become ready", idx), ctx.Err())
 		case <-c.servers[idx].Stopper().ShouldQuiesce():
-			return errors.Newf("server %s shut down prematurely", idx)
+			return errors.Newf("server %d shut down prematurely", idx)
 		case <-c.stopper.ShouldQuiesce():
 			return errors.Newf("demo cluster shut down prematurely while waiting for server %d to become ready", idx)
 		default:
@@ -1060,6 +1066,13 @@ func (c *transientCluster) DrainAndShutdown(ctx context.Context, nodeID int32) e
 	if err := c.drainAndShutdown(ctx, c.servers[serverIdx].adminClient); err != nil {
 		return err
 	}
+
+	select {
+	case <-c.servers[serverIdx].Stopper().IsStopped():
+	case <-time.After(10 * time.Second):
+		return errors.Errorf("server stopper not stopped after 10 seconds")
+	}
+
 	c.servers[serverIdx].TestServerInterface = nil
 	c.servers[serverIdx].adminClient = nil
 	if c.demoCtx.Multitenant {

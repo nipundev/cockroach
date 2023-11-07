@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"math/rand"
 	"net"
 	"net/url"
 	"os"
@@ -35,6 +36,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/cluster"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/option"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/registry"
+	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/roachtestflags"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/roachtestutil"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/spec"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/test"
@@ -51,7 +53,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
 	_ "github.com/lib/pq"
-	"github.com/spf13/pflag"
 )
 
 func init() {
@@ -59,63 +60,14 @@ func init() {
 }
 
 var (
-	// user-specified path to crdb binary
-	cockroachPath string
 	// maps cpuArch to the corresponding crdb binary's absolute path
 	cockroach = make(map[vm.CPUArch]string)
-	// user-specified path to crdb binary with runtime assertions enabled (EA)
-	cockroachEAPath string
 	// maps cpuArch to the corresponding crdb binary with runtime assertions enabled (EA)
 	cockroachEA = make(map[vm.CPUArch]string)
-	// user-specified path to workload binary
-	workloadPath string
 	// maps cpuArch to the corresponding workload binary's absolute path
 	workload = make(map[vm.CPUArch]string)
 	// maps cpuArch to the corresponding dynamically-linked libraries' absolute paths
 	libraryFilePaths = make(map[vm.CPUArch][]string)
-	cloud            = spec.GCE
-	// encryptionProbability controls when encryption-at-rest is enabled
-	// in a cluster for tests that have opted-in to metamorphic
-	// encryption (EncryptionMetamorphic).
-	//
-	// Tests that have opted-in to metamorphic encryption will run with
-	// encryption enabled by default (probability 1). In order to run
-	// them with encryption disabled (perhaps to reproduce a test
-	// failure), roachtest can be invoked with --metamorphic-encryption-probability=0
-	encryptionProbability float64
-	// Total probability with which new ARM64 clusters are provisioned, modulo test specs. which are incompatible.
-	// N.B. if all selected tests are incompatible with ARM64, then arm64Probability is effectively 0.
-	// In other words, ClusterSpec.Arch takes precedence over the arm64Probability flag.
-	arm64Probability float64
-	// Conditional probability with which new FIPS clusters are provisioned, modulo test specs. The total probability
-	// is the product of this and 1-arm64Probability.
-	// As in the case of arm64Probability, ClusterSpec.Arch takes precedence over the fipsProbability flag.
-	fipsProbability float64
-
-	instanceType              string
-	localSSDArg               bool
-	deprecatedRoachprodBinary string
-	// overrideOpts contains vm.CreateOpts override values passed from the cli.
-	overrideOpts vm.CreateOpts
-	// overrideFlagset represents the flags passed from the cli for
-	// `run` command (used to know if the value of a flag changed,
-	// for example: overrideFlagset("lifetime").Changed().
-	// TODO(ahmad/healthy-pod): extract runCmd (and other commands) from main
-	// to make it global and operate on runCmd.Flags() directly.
-	overrideFlagset  *pflag.FlagSet
-	overrideNumNodes = -1
-	clusterName      string
-	local            bool
-	clusterWipe      bool
-	zonesF           string
-	teamCity         bool
-	disableIssue     bool
-)
-
-const (
-	defaultEncryptionProbability = 1
-	defaultFIPSProbability       = 0
-	defaultARM64Probability      = 0
 )
 
 type errBinaryOrLibraryNotFound struct {
@@ -178,7 +130,7 @@ func findBinary(
 
 func findLibrary(libraryName string, os string, arch vm.CPUArch) (string, error) {
 	suffix := ".so"
-	if cloud == spec.Local {
+	if roachtestflags.Cloud == spec.Local {
 		switch runtime.GOOS {
 		case "linux":
 		case "freebsd":
@@ -308,9 +260,9 @@ func initBinariesAndLibraries() {
 	//	see https://github.com/cockroachdb/cockroach/issues/104029.
 	defaultOSName := "linux"
 	defaultArch := vm.ArchAMD64
-	if cloud == spec.Local {
+	if roachtestflags.Cloud == spec.Local {
 		defaultOSName = runtime.GOOS
-		if arm64Probability == 1 {
+		if roachtestflags.ARM64Probability == 1 {
 			// N.B. if arm64Probability != 1, then we're running a local cluster with both arm64 and amd64.
 			defaultArch = vm.ArchARM64
 		}
@@ -361,6 +313,9 @@ func initBinariesAndLibraries() {
 	// We need to verify we have at least both the cockroach and the workload binaries.
 	var err error
 
+	cockroachPath := roachtestflags.CockroachPath
+	cockroachEAPath := roachtestflags.CockroachEAPath
+	workloadPath := roachtestflags.WorkloadPath
 	cockroach[defaultArch], _ = resolveBinary("cockroach", cockroachPath, defaultArch, true, false)
 	workload[defaultArch], _ = resolveBinary("workload", workloadPath, defaultArch, true, false)
 	cockroachEA[defaultArch], err = resolveBinary("cockroach-ea", cockroachEAPath, defaultArch, false, true)
@@ -368,7 +323,7 @@ func initBinariesAndLibraries() {
 		fmt.Fprintf(os.Stderr, "WARN: unable to find %q for %q: %s\n", "cockroach-ea", defaultArch, err)
 	}
 
-	if arm64Probability > 0 && defaultArch != vm.ArchARM64 {
+	if roachtestflags.ARM64Probability > 0 && defaultArch != vm.ArchARM64 {
 		fmt.Printf("Locating and verifying binaries for os=%q, arch=%q\n", defaultOSName, vm.ArchARM64)
 		// We need to verify we have all the required binaries for arm64.
 		cockroach[vm.ArchARM64], _ = resolveBinary("cockroach", cockroachPath, vm.ArchARM64, true, false)
@@ -378,7 +333,7 @@ func initBinariesAndLibraries() {
 			fmt.Fprintf(os.Stderr, "WARN: unable to find %q for %q: %s\n", "cockroach-ea", vm.ArchARM64, err)
 		}
 	}
-	if fipsProbability > 0 && defaultArch != vm.ArchFIPS {
+	if roachtestflags.FIPSProbability > 0 && defaultArch != vm.ArchFIPS {
 		fmt.Printf("Locating and verifying binaries for os=%q, arch=%q\n", defaultOSName, vm.ArchFIPS)
 		// We need to verify we have all the required binaries for fips.
 		cockroach[vm.ArchFIPS], _ = resolveBinary("cockroach", cockroachPath, vm.ArchFIPS, true, false)
@@ -392,11 +347,11 @@ func initBinariesAndLibraries() {
 	// In v20.2 or higher, optionally expect certain library files to exist.
 	// Since they may not be found in older versions, do not hard error if they are not found.
 	for _, arch := range []vm.CPUArch{vm.ArchAMD64, vm.ArchARM64, vm.ArchFIPS} {
-		if arm64Probability == 0 && defaultArch != vm.ArchARM64 && arch == vm.ArchARM64 {
+		if roachtestflags.ARM64Probability == 0 && defaultArch != vm.ArchARM64 && arch == vm.ArchARM64 {
 			// arm64 isn't used, skip finding libs for it.
 			continue
 		}
-		if fipsProbability == 0 && arch == vm.ArchFIPS {
+		if roachtestflags.FIPSProbability == 0 && arch == vm.ArchFIPS {
 			// fips isn't used, skip finding libs for it.
 			continue
 		}
@@ -689,8 +644,13 @@ type clusterImpl struct {
 	// BAZEL_COVER_DIR will be set to this value when starting a node.
 	goCoverDir string
 
-	os   string     // OS of the cluster
-	arch vm.CPUArch // CPU architecture of the cluster
+	os         string     // OS of the cluster
+	arch       vm.CPUArch // CPU architecture of the cluster
+	randomSeed struct {
+		mu   syncutil.Mutex
+		seed *int64
+	}
+
 	// destroyState contains state related to the cluster's destruction.
 	destroyState destroyState
 }
@@ -838,29 +798,24 @@ func (f *clusterFactory) genName(cfg clusterConfig) string {
 }
 
 // createFlagsOverride updates opts with the override values passed from the cli.
-func createFlagsOverride(flags *pflag.FlagSet, opts *vm.CreateOpts) {
-	if flags != nil {
-		if flags.Changed("lifetime") {
-			opts.Lifetime = overrideOpts.Lifetime
-		}
-		if flags.Changed("roachprod-local-ssd") {
-			opts.SSDOpts.UseLocalSSD = overrideOpts.SSDOpts.UseLocalSSD
-		}
-		if flags.Changed("filesystem") {
-			opts.SSDOpts.FileSystem = overrideOpts.SSDOpts.FileSystem
-		}
-		if flags.Changed("local-ssd-no-ext4-barrier") {
-			opts.SSDOpts.NoExt4Barrier = overrideOpts.SSDOpts.NoExt4Barrier
-		}
-		if flags.Changed("os-volume-size") {
-			opts.OsVolumeSize = overrideOpts.OsVolumeSize
-		}
-		if flags.Changed("geo") {
-			opts.GeoDistributed = overrideOpts.GeoDistributed
-		}
-		if flags.Changed("label") {
-			opts.CustomLabels = overrideOpts.CustomLabels
-		}
+func createFlagsOverride(opts *vm.CreateOpts) {
+	if roachtestflags.Changed(&roachtestflags.Lifetime) {
+		opts.Lifetime = roachtestflags.Lifetime
+	}
+	if roachtestflags.Changed(&roachtestflags.OverrideUseLocalSSD) {
+		opts.SSDOpts.UseLocalSSD = roachtestflags.OverrideUseLocalSSD
+	}
+	if roachtestflags.Changed(&roachtestflags.OverrideFilesystem) {
+		opts.SSDOpts.FileSystem = roachtestflags.OverrideFilesystem
+	}
+	if roachtestflags.Changed(&roachtestflags.OverrideNoExt4Barrier) {
+		opts.SSDOpts.NoExt4Barrier = roachtestflags.OverrideNoExt4Barrier
+	}
+	if roachtestflags.Changed(&roachtestflags.OverrideOSVolumeSizeGB) {
+		opts.OsVolumeSize = roachtestflags.OverrideOSVolumeSizeGB
+	}
+	if roachtestflags.Changed(&roachtestflags.OverrideGeoDistributed) {
+		opts.GeoDistributed = roachtestflags.OverrideGeoDistributed
 	}
 }
 
@@ -886,8 +841,8 @@ func (f *clusterFactory) newCluster(
 		return nil, nil, errors.Wrap(ctx.Err(), "newCluster")
 	}
 
-	if overrideFlagset != nil && overrideFlagset.Changed("nodes") {
-		cfg.spec.NodeCount = overrideNumNodes
+	if roachtestflags.Changed(&roachtestflags.OverrideNumNodes) {
+		cfg.spec.NodeCount = roachtestflags.OverrideNumNodes
 	}
 
 	if cfg.spec.NodeCount == 0 {
@@ -921,9 +876,9 @@ func (f *clusterFactory) newCluster(
 		UseIOBarrierOnLocalSSD: cfg.useIOBarrier,
 		PreferredArch:          cfg.arch,
 	}
-	params.Defaults.MachineType = instanceType
-	params.Defaults.Zones = zonesF
-	params.Defaults.PreferLocalSSD = localSSDArg
+	params.Defaults.MachineType = roachtestflags.InstanceType
+	params.Defaults.Zones = roachtestflags.Zones
+	params.Defaults.PreferLocalSSD = roachtestflags.PreferLocalSSD
 
 	// The ClusterName is set below in the retry loop to ensure
 	// that each create attempt gets a unique cluster name.
@@ -941,8 +896,7 @@ func (f *clusterFactory) newCluster(
 	if cfg.spec.UbuntuVersion.IsOverridden() {
 		createVMOpts.UbuntuVersion = cfg.spec.UbuntuVersion
 	}
-
-	createFlagsOverride(overrideFlagset, &createVMOpts)
+	createFlagsOverride(&createVMOpts)
 	// Make sure expiration is changed if --lifetime override flag
 	// is passed.
 	cfg.spec.Lifetime = createVMOpts.Lifetime
@@ -1074,7 +1028,7 @@ func attachToExistingCluster(
 			return nil, err
 		}
 		if !opt.skipWipe {
-			if clusterWipe {
+			if roachtestflags.ClusterWipe {
 				if err := c.WipeE(ctx, l, false /* preserveCerts */, c.All()); err != nil {
 					return nil, err
 				}
@@ -1721,7 +1675,7 @@ func (c *clusterImpl) doDestroy(ctx context.Context, l *logger.Logger) <-chan st
 		return inFlight
 	}
 
-	if clusterWipe {
+	if roachtestflags.ClusterWipe {
 		if c.destroyState.owned {
 			l.PrintfCtx(ctx, "destroying cluster %s...", c)
 			c.status("destroying cluster")
@@ -2003,10 +1957,16 @@ func (c *clusterImpl) StartE(
 
 	startOpts.RoachprodOpts.EncryptedStores = c.encAtRest
 
-	if !envExists(settings.Env, "COCKROACH_CRASH_ON_SPAN_USE_AFTER_FINISH") {
-		// Panic on span use-after-Finish, so we catch such bugs.
-		settings.Env = append(settings.Env, "COCKROACH_CRASH_ON_SPAN_USE_AFTER_FINISH=true")
+	setUnlessExists := func(name string, value interface{}) {
+		if !envExists(settings.Env, name) {
+			settings.Env = append(settings.Env, fmt.Sprintf("%s=%s", name, fmt.Sprint(value)))
+		}
 	}
+	// Panic on span use-after-Finish, so we catch such bugs.
+	setUnlessExists("COCKROACH_CRASH_ON_SPAN_USE_AFTER_FINISH", true)
+	// Set the same seed on every node, to be used by builds with
+	// runtime assertions enabled.
+	setUnlessExists("COCKROACH_RANDOM_SEED", c.cockroachRandomSeed())
 
 	// Needed for backward-compat on crdb_internal.ranges{_no_leases}.
 	// Remove in v23.2.
@@ -2071,6 +2031,38 @@ func (c *clusterImpl) RefetchCertsFromNode(ctx context.Context, node int) error 
 	})
 }
 
+// SetRandomSeed sets the random seed to be used by the cluster. If
+// not called, clusters generate a random seed from the global
+// generator in the `rand` package. This function must be called
+// before any nodes in the cluster start.
+func (c *clusterImpl) SetRandomSeed(seed int64) {
+	c.randomSeed.seed = &seed
+}
+
+// cockroachRandomSeed returns the `COCKROACH_RANDOM_SEED` to be used
+// by this cluster. The seed may have been previously set by a
+// previous call to `StartE`, or by the user via `SetRandomSeed`. If
+// not set, this function will generate a seed and return it.
+func (c *clusterImpl) cockroachRandomSeed() int64 {
+	c.randomSeed.mu.Lock()
+	defer c.randomSeed.mu.Unlock()
+
+	// If the user provided a seed via environment variable, always use
+	// that, even if the test attempts to set a different seed.
+	if seedStr := os.Getenv(test.EnvAssertionsEnabledSeed); seedStr != "" {
+		seedOverride, err := strconv.ParseInt(seedStr, 0, 64)
+		if err != nil {
+			panic(fmt.Sprintf("error parsing %s: %s", test.EnvAssertionsEnabledSeed, err))
+		}
+		c.randomSeed.seed = &seedOverride
+	} else if c.randomSeed.seed == nil {
+		seed := rand.Int63()
+		c.randomSeed.seed = &seed
+	}
+
+	return *c.randomSeed.seed
+}
+
 // Start is like StartE() except that it will fatal the test on error.
 func (c *clusterImpl) Start(
 	ctx context.Context,
@@ -2103,6 +2095,15 @@ func (c *clusterImpl) StopE(
 	}
 	if c.spec.NodeCount == 0 {
 		return nil // unit tests
+	}
+	if c.goCoverDir != "" {
+		// Never kill processes if we're trying to collect coverage; use SIGUSR1
+		// which dumps coverage data and exits.
+		if stopOpts.RoachprodOpts.Sig == 9 {
+			stopOpts.RoachprodOpts.Sig = 10 // SIGUSR1
+			stopOpts.RoachprodOpts.Wait = true
+			stopOpts.RoachprodOpts.MaxWait = 10
+		}
 	}
 	c.setStatusForClusterOpt("stopping", stopOpts.RoachtestOpts.Worker, nodes...)
 	defer c.clearStatusForClusterOpt(stopOpts.RoachtestOpts.Worker)
@@ -2706,9 +2707,9 @@ func archForTest(ctx context.Context, l *logger.Logger, testSpec registry.TestSp
 	// CPU architecture is unspecified, choose one according to the
 	// probability distribution.
 	var arch vm.CPUArch
-	if prng.Float64() < arm64Probability {
+	if prng.Float64() < roachtestflags.ARM64Probability {
 		arch = vm.ArchARM64
-	} else if prng.Float64() < fipsProbability {
+	} else if prng.Float64() < roachtestflags.FIPSProbability {
 		// N.B. branch is taken with probability
 		//   (1 - arm64Probability) * fipsProbability
 		// which is P(fips & amd64).

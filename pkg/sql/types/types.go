@@ -541,6 +541,7 @@ var (
 		Uuid,
 		INet,
 		PGLSN,
+		RefCursor,
 		Time,
 		TimeTZ,
 		Jsonb,
@@ -2130,6 +2131,16 @@ func (t *T) Identical(other *T) bool {
 // Equal is for use in generated protocol buffer code only.
 func (t *T) Equal(other *T) bool {
 	return t.Identical(other)
+}
+
+// IsWildcardType returns true if the type is only used as a wildcard during
+// static analysis, and cannot be used during execution.
+func (t *T) IsWildcardType() bool {
+	switch t {
+	case Any, AnyArray, AnyCollatedString, AnyEnum, AnyEnumArray, AnyTuple, AnyTupleArray:
+		return true
+	}
+	return false
 }
 
 // Size returns the size, in bytes, of this type once it has been marshaled to

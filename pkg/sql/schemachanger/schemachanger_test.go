@@ -13,10 +13,8 @@ package schemachanger_test
 import (
 	"context"
 	"encoding/hex"
-	"flag"
 	"fmt"
 	"math/rand"
-	"os"
 	"regexp"
 	"strings"
 	"sync"
@@ -38,7 +36,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scexec"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scop"
-	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scplan"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/sctest"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondatapb"
@@ -493,6 +490,67 @@ func TestSchemaChangeWaitsForConcurrentSchemaChanges(t *testing.T) {
 			"defaultdb", "t", expectedKeyCount)
 	}
 
+	typeSchemaChangeFunc := func(t *testing.T, modeFor1stStmt, modeFor2ndStmt sessiondatapb.NewSchemaChangerMode) {
+		ctx, cancel := context.WithCancel(context.Background())
+		addTypeStartedChan := make(chan struct{})
+		resumeAddTypeJobChan := make(chan struct{})
+		var closeAddTypeValueChanOnce sync.Once
+		schemaChangeWaitCompletedChan := make(chan struct{})
+
+		var params base.TestServerArgs
+		params.Knobs = base.TestingKnobs{
+			SQLDeclarativeSchemaChanger: &scexec.TestingKnobs{
+				// If the blocked schema changer is from legacy schema changer, we let
+				// it hijack this knob (which is originally design for declarative
+				// schema changer) if `stmt` is nil.
+				WhileWaitingForConcurrentSchemaChanges: func(stmts []string) {
+					if (len(stmts) == 1 && strings.Contains(stmts[0], "DROP TYPE")) ||
+						stmts == nil {
+						closeAddTypeValueChanOnce.Do(func() {
+							close(resumeAddTypeJobChan)
+							close(schemaChangeWaitCompletedChan)
+						})
+					}
+				},
+			},
+			// Decrease the adopt loop interval so that retries happen quickly.
+			JobsTestingKnobs: jobs.NewTestingKnobsWithShortIntervals(),
+			// Prevent the GC job from running so we ensure that all the keys which
+			// were written remain.
+			GCJob: &sql.GCJobTestingKnobs{RunBeforeResume: func(jobID jobspb.JobID) error {
+				<-ctx.Done()
+				return ctx.Err()
+			}},
+		}
+		s, sqlDB, _ := serverutils.StartServer(t, params)
+		defer s.Stopper().Stop(ctx)
+		defer cancel()
+		tdb := sqlutils.MakeSQLRunner(sqlDB)
+
+		tdb.Exec(t, "CREATE TYPE status AS ENUM ('open', 'closed', 'inactive');")
+
+		// Execute 1st DDL asynchronously and block until it's executing.
+		tdb.Exec(t, `SET use_declarative_schema_changer = $1`, modeFor1stStmt.String())
+		go func() {
+			tdb.Exec(t, `SET CLUSTER SETTING jobs.debug.pausepoints="typeschemachanger.before.exec"`)
+			tdb.ExpectErr(t,
+				".*was paused before it completed with reason: pause point \"typeschemachanger.before.exec\" hit",
+				`ALTER TYPE status ADD VALUE 'unknown';`)
+			close(addTypeStartedChan)
+			<-resumeAddTypeJobChan // wait for DROP TYPE to unblock me
+			tdb.Exec(t, `SET CLUSTER SETTING jobs.debug.pausepoints=""`)
+			tdb.Exec(t, "RESUME JOB (SELECT job_id FROM crdb_internal.jobs WHERE status='paused' FETCH FIRST 1 ROWS ONLY);\n")
+		}()
+		<-addTypeStartedChan
+
+		// Execute 2st DDL synchronously. During waiting, it will unblock 1st DDL so
+		// it will eventually be able to proceed after waiting for a while.
+		tdb.Exec(t, `SET use_declarative_schema_changer = $1`, modeFor2ndStmt.String())
+		tdb.Exec(t, `DROP TYPE STATUS;`)
+		// After completion make sure we actually waited for schema changes.
+		<-schemaChangeWaitCompletedChan
+	}
+
 	t.Run("declarative-then-declarative", func(t *testing.T) {
 		tf(t, sessiondatapb.UseNewSchemaChangerUnsafeAlways, sessiondatapb.UseNewSchemaChangerUnsafeAlways)
 	})
@@ -503,6 +561,10 @@ func TestSchemaChangeWaitsForConcurrentSchemaChanges(t *testing.T) {
 
 	t.Run("legacy-then-declarative", func(t *testing.T) {
 		tf(t, sessiondatapb.UseNewSchemaChangerOff, sessiondatapb.UseNewSchemaChangerUnsafeAlways)
+	})
+
+	t.Run("typedesc legacy-then-declarative", func(t *testing.T) {
+		typeSchemaChangeFunc(t, sessiondatapb.UseNewSchemaChangerOff, sessiondatapb.UseNewSchemaChangerUnsafeAlways)
 	})
 
 	// legacy + legacy case is tested in TestLegacySchemaChangerWaitsForOtherSchemaChanges
@@ -794,28 +856,13 @@ func isPQErrWithCode(err error, codes ...pgcode.Code) bool {
 	return false
 }
 
-var _ sctest.StmtLineReader = (*staticSQLStmtLineProvider)(nil)
-
-type staticSQLStmtLineProvider struct {
-	stmts []string
-	next  int
-}
-
-func (ss *staticSQLStmtLineProvider) HasNextLine() bool {
-	return ss.next != len(ss.stmts)
-}
-
-func (ss *staticSQLStmtLineProvider) NextLine() string {
-	ss.next++
-	return ss.stmts[ss.next-1]
-}
-
 // TestCompareLegacyAndDeclarative tests that when processing a sequence of
 // DDL statements, legacy and declarative schema change should transition the
 // descriptors into the same final state.
 func TestCompareLegacyAndDeclarative(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
+	skip.UnderStressRace(t, "too slow under stress race")
 
 	ss := &staticSQLStmtLineProvider{
 		stmts: []string{
@@ -903,65 +950,4 @@ func TestCompareLegacyAndDeclarative(t *testing.T) {
 	}
 
 	sctest.CompareLegacyAndDeclarative(t, ss)
-}
-
-var logictestStmtsCorpusFile = flag.String("logictest-stmt-corpus-path", "", "path to logictest stmts corpus")
-
-func TestComparatorFromLogicTests(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	defer log.Scope(t).Close(t)
-	if *logictestStmtsCorpusFile == "" {
-		skip.IgnoreLint(t, "require `--logictest-stmt-corpus-path` to be set")
-	}
-
-	bytes, err := os.ReadFile(*logictestStmtsCorpusFile)
-	require.NoError(t, err)
-	corpus := scpb.LogicTestStmtsCorpus{}
-	err = protoutil.Unmarshal(bytes, &corpus)
-	require.NoError(t, err)
-
-	// Shuffle entries so the order of execution is different each time. It might
-	// speed up finding bugs.
-	rand.Shuffle(len(corpus.Entries), func(i, j int) {
-		corpus.Entries[i], corpus.Entries[j] = corpus.Entries[j], corpus.Entries[i]
-	})
-
-	for _, entry := range corpus.Entries {
-		subtestName := entry.Name
-		subtestStatements := entry.Statements
-
-		t.Run(subtestName, func(t *testing.T) {
-			if skipEntry, skipReason := shouldSkipLogicTestCorpusEntry(subtestName); skipEntry {
-				skip.IgnoreLint(t, skipReason)
-			}
-
-			t.Logf("running schema changer comparator testing on statements collected from logic test %q\n", subtestName)
-			ss := &staticSQLStmtLineProvider{
-				stmts: subtestStatements,
-			}
-			sctest.CompareLegacyAndDeclarative(t, ss)
-			t.Logf("schema changer comparator testing succeeded on logic test %q\n", subtestName)
-		})
-	}
-}
-
-// shouldSkipLogicTestCorpusEntry is the place where we blacklist entries in the
-// logictest stmts corpus. Each blacklisted entry should be justified with
-// comments.
-func shouldSkipLogicTestCorpusEntry(entryName string) (skip bool, skipReason string) {
-	switch entryName {
-	case "crdb_internal":
-		// `crdb_internal` contains stmts like `SELECT crdb_internal.force_panic('foo')`
-		// that will cause the framework to crash. Also, in general, we don't care about
-		// crdb_internal functions for purpose of schema changer comparator testing.
-		return true, `"crdb_internal" contains statement like "crdb_internal.force_panic()" that would crash the testing framework`
-	case "schema_repair":
-		// `schema_repair` contains stmts like `SELECT crdb_internal.unsafe_delete_descriptor(id)`
-		// that will corrupt descriptors. This subsequently would fail the query that
-		// attempts to fetch all descriptors during the post-execution metadata
-		// identity check.
-		return true, `"schema_repair" contains statement like "crdb_internal.unsafe_delete_descriptor(id)" that would cause descriptor corruptions, which would subsequently fail the query to fetch descriptors during the metadata identity check`
-	default:
-		return false, ""
-	}
 }

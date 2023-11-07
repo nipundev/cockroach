@@ -3571,11 +3571,16 @@ value if you rely on the HLC for accuracy.`,
 						if err != nil {
 							return nil, err
 						}
+					} else {
+						err = strArray.Append(tree.DNull)
+						if err != nil {
+							return nil, err
+						}
 					}
 				}
 				return strArray, nil
 			},
-			Info:              "Convert a JSONB array into a string array, removing 'null' elements.",
+			Info:              "Convert a JSONB array into a string array.",
 			Volatility:        volatility.Immutable,
 			CalledOnNullInput: true,
 		}),
@@ -4932,7 +4937,7 @@ value if you rely on the HLC for accuracy.`,
 			Types:      tree.ParamTypes{},
 			ReturnType: tree.FixedReturnType(types.String),
 			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
-				v := evalCtx.Settings.Version.BinaryVersion().String()
+				v := evalCtx.Settings.Version.LatestVersion().String()
 				return tree.NewDString(v), nil
 			},
 			Info:       "Returns the version of CockroachDB this node is running.",
@@ -4987,6 +4992,37 @@ value if you rely on the HLC for accuracy.`,
 			},
 			Info:       "Returns true if the cluster version is not older than the argument.",
 			Volatility: volatility.Volatile,
+		},
+	),
+
+	"crdb_internal.release_series": makeBuiltin(
+		tree.FunctionProperties{Category: builtinconstants.CategorySystemInfo},
+		tree.Overload{
+			Types:      tree.ParamTypes{{Name: "version", Typ: types.String}},
+			ReturnType: tree.FixedReturnType(types.String),
+			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
+				s, ok := tree.AsDString(args[0])
+				if !ok {
+					return nil, errors.Newf("expected string value, got %T", args[0])
+				}
+				version, err := roachpb.ParseVersion(string(s))
+				if err != nil {
+					return nil, err
+				}
+				if version.Less(clusterversion.MinSupported.Version()) || clusterversion.Latest.Version().Less(version) {
+					return nil, errors.Newf(
+						"version %s not supported; this binary only understands versions %s through %s",
+						args[0], clusterversion.MinSupported, clusterversion.Latest,
+					)
+				}
+				for k := clusterversion.Latest; ; k-- {
+					if k.Version().LessEq(version) {
+						return tree.NewDString(k.ReleaseSeries().String()), nil
+					}
+				}
+			},
+			Info:       "Converts a cluster version to the final cluster version in that release series.",
+			Volatility: volatility.Stable,
 		},
 	),
 
@@ -8555,7 +8591,9 @@ specified store on the node it's run from. One of 'mvccGC', 'merge', 'split',
 			ReturnType: tree.FixedReturnType(types.Int),
 			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
 				if args[0] == tree.DNull {
-					return nil, errors.AssertionFailedf("expected non-null argument for plpgsql_close")
+					return nil, pgerror.New(
+						pgcode.NullValueNotAllowed, "cursor name for CLOSE statement cannot be null",
+					)
 				}
 				return tree.DNull, evalCtx.Planner.PLpgSQLCloseCursor(tree.Name(tree.MustBeDString(args[0])))
 			},
@@ -8577,6 +8615,13 @@ specified store on the node it's run from. One of 'mvccGC', 'merge', 'split',
 			},
 			ReturnType: tree.IdentityReturnType(3),
 			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
+				for i := range args {
+					if args[i] == tree.DNull {
+						return nil, pgerror.New(
+							pgcode.NullValueNotAllowed, "FETCH statement option cannot be null",
+						)
+					}
+				}
 				cursorName := tree.MustBeDString(args[0])
 				cursorDir := tree.MustBeDInt(args[1])
 				cursorCount := tree.MustBeDInt(args[2])

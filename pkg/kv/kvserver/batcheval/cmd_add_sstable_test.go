@@ -375,11 +375,11 @@ func TestEvalAddSSTable(t *testing.T) {
 			sst:        kvs{pointKV("b", 3, "sst")},
 			expectErr:  &kvpb.LockConflictError{},
 		},
-		"DisallowConflicts ignores intents in span": { // inconsistent with blind writes
+		"DisallowConflicts returns LockConflictError in span": {
 			noConflict: true,
 			data:       kvs{pointKV("b", intentTS, "intent")},
 			sst:        kvs{pointKV("a", 3, "sst"), pointKV("c", 3, "sst")},
-			expect:     kvs{pointKV("a", 3, "sst"), pointKV("b", intentTS, "intent"), pointKV("c", 3, "sst")},
+			expectErr:  &kvpb.LockConflictError{},
 		},
 		"DisallowConflicts is not idempotent": {
 			noConflict: true,
@@ -479,11 +479,11 @@ func TestEvalAddSSTable(t *testing.T) {
 			sst:       kvs{pointKV("b", 3, "sst")},
 			expectErr: &kvpb.LockConflictError{},
 		},
-		"DisallowShadowing ignores intents in span": { // inconsistent with blind writes
-			noShadow: true,
-			data:     kvs{pointKV("b", intentTS, "intent")},
-			sst:      kvs{pointKV("a", 3, "sst"), pointKV("c", 3, "sst")},
-			expect:   kvs{pointKV("a", 3, "sst"), pointKV("b", intentTS, "intent"), pointKV("c", 3, "sst")},
+		"DisallowShadowing returns LockConflictError in span": {
+			noShadow:  true,
+			data:      kvs{pointKV("b", intentTS, "intent")},
+			sst:       kvs{pointKV("a", 3, "sst"), pointKV("c", 3, "sst")},
+			expectErr: &kvpb.LockConflictError{},
 		},
 		"DisallowShadowing is idempotent": {
 			noShadow: true,
@@ -607,11 +607,11 @@ func TestEvalAddSSTable(t *testing.T) {
 			sst:           kvs{pointKV("b", 3, "sst")},
 			expectErr:     &kvpb.LockConflictError{},
 		},
-		"DisallowShadowingBelow ignores intents in span": { // inconsistent with blind writes
+		"DisallowShadowingBelow returns LockConflictError in span": {
 			noShadowBelow: 5,
 			data:          kvs{pointKV("b", intentTS, "intent")},
 			sst:           kvs{pointKV("a", 3, "sst"), pointKV("c", 3, "sst")},
-			expect:        kvs{pointKV("a", 3, "sst"), pointKV("b", intentTS, "intent"), pointKV("c", 3, "sst")},
+			expectErr:     &kvpb.LockConflictError{},
 		},
 		"DisallowShadowingBelow is not generally idempotent": {
 			noShadowBelow: 5,
@@ -1142,7 +1142,8 @@ func TestEvalAddSSTable(t *testing.T) {
 								kv.Key.Timestamp.WallTime *= 1e9
 								v, err := storage.DecodeMVCCValue(kv.Value)
 								require.NoError(t, err)
-								require.NoError(t, storage.MVCCPut(ctx, b, kv.Key.Key, kv.Key.Timestamp, v.Value, storage.MVCCWriteOptions{Txn: txn}))
+								_, err = storage.MVCCPut(ctx, b, kv.Key.Key, kv.Key.Timestamp, v.Value, storage.MVCCWriteOptions{Txn: txn})
+								require.NoError(t, err)
 							case storage.MVCCRangeKeyValue:
 								v, err := storage.DecodeMVCCValue(kv.Value)
 								require.NoError(t, err)
