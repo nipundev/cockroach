@@ -28,6 +28,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/admission"
 	"github.com/cockroachdb/cockroach/pkg/util/admission/admissionpb"
@@ -220,13 +221,24 @@ func (r Result) Release(ctx context.Context) {
 type Streamer struct {
 	distSender *kvcoord.DistSender
 	stopper    *stop.Stopper
+	// sd can be nil in tests.
+	sd *sessiondata.SessionData
 
-	mode           OperationMode
-	hints          Hints
-	maxKeysPerRow  int32
-	budget         *budget
-	lockStrength   lock.Strength
-	lockDurability lock.Durability
+	mode          OperationMode
+	hints         Hints
+	maxKeysPerRow int32
+	// eagerMemUsageLimitBytes determines the maximum memory used from the
+	// budget at which point the streamer stops sending non-head-of-the-line
+	// requests eagerly.
+	eagerMemUsageLimitBytes int64
+	// headOfLineOnlyFraction controls the fraction of the available streamer's
+	// memory budget that will be used to set the TargetBytes limit on
+	// head-of-the-line request in case the "eager" memory usage limit has been
+	// exceeded. In such case, only head-of-the-line request will be sent.
+	headOfLineOnlyFraction float64
+	budget                 *budget
+	lockStrength           lock.Strength
+	lockDurability         lock.Durability
 
 	streamerStatistics
 
@@ -356,6 +368,8 @@ func max(a, b int64) int64 {
 // to interact with the account only after canceling the Streamer (because
 // memory accounts are not thread-safe).
 //
+// sd can be nil in tests in which case some reasonable defaults will be used.
+//
 // kvPairsRead should be incremented atomically with the sum of NumKeys
 // parameters of all received responses.
 //
@@ -366,6 +380,7 @@ func NewStreamer(
 	stopper *stop.Stopper,
 	txn *kv.Txn,
 	st *cluster.Settings,
+	sd *sessiondata.SessionData,
 	lockWaitPolicy lock.WaitPolicy,
 	limitBytes int64,
 	acc *mon.BoundAccount,
@@ -377,12 +392,19 @@ func NewStreamer(
 	if txn.Type() != kv.LeafTxn {
 		panic(errors.AssertionFailedf("RootTxn is given to the Streamer"))
 	}
+	// sd can be nil in tests.
+	headOfLineOnlyFraction := 0.8
+	if sd != nil {
+		headOfLineOnlyFraction = sd.StreamerHeadOfLineOnlyFraction
+	}
 	s := &Streamer{
-		distSender:     distSender,
-		stopper:        stopper,
-		budget:         newBudget(acc, limitBytes),
-		lockStrength:   lockStrength,
-		lockDurability: lockDurability,
+		distSender:             distSender,
+		stopper:                stopper,
+		sd:                     sd,
+		headOfLineOnlyFraction: headOfLineOnlyFraction,
+		budget:                 newBudget(acc, limitBytes),
+		lockStrength:           lockStrength,
+		lockDurability:         lockDurability,
 	}
 
 	if kvPairsRead == nil {
@@ -425,12 +447,29 @@ func (s *Streamer) Init(
 	mode OperationMode, hints Hints, maxKeysPerRow int, diskBuffer ResultDiskBuffer,
 ) {
 	s.mode = mode
+	// s.sd can be nil in tests, so use almost all the budget eagerly then.
+	eagerFraction := 0.9
 	if mode == OutOfOrder {
 		s.requestsToServe = newOutOfOrderRequestsProvider()
 		s.results = newOutOfOrderResultsBuffer(s.budget)
+		if s.sd != nil {
+			eagerFraction = s.sd.StreamerOutOfOrderEagerMemoryUsageFraction
+		}
 	} else {
 		s.requestsToServe = newInOrderRequestsProvider()
 		s.results = newInOrderResultsBuffer(s.budget, diskBuffer)
+		if s.sd != nil {
+			eagerFraction = s.sd.StreamerInOrderEagerMemoryUsageFraction
+		}
+	}
+	s.eagerMemUsageLimitBytes = int64(math.Ceil(float64(s.budget.limitBytes) * eagerFraction))
+	// Ensure some reasonable lower bound.
+	const minEagerMemUsage = 10 << 10 // 10KiB
+	if s.eagerMemUsageLimitBytes <= 0 {
+		// Protect from overflow.
+		s.eagerMemUsageLimitBytes = math.MaxInt64
+	} else if s.eagerMemUsageLimitBytes < minEagerMemUsage {
+		s.eagerMemUsageLimitBytes = minEagerMemUsage
 	}
 	if !hints.UniqueRequests {
 		panic(errors.AssertionFailedf("only unique requests are currently supported"))
@@ -840,26 +879,28 @@ func (w *workerCoordinator) mainLoop(ctx context.Context) {
 	defer log.VEvent(ctx, 2, "exiting coordinator main loop")
 	defer w.s.waitGroup.Done()
 	for {
-		if err := w.waitForRequests(ctx); err != nil {
-			w.s.results.setError(err)
+		if shouldExit := w.waitForRequests(ctx); shouldExit {
 			return
 		}
 
-		var atLeastBytes int64
-		// The higher the value of priority is, the lower the actual priority of
-		// spilling. Use the maximum value by default.
-		spillingPriority := math.MaxInt64
 		w.s.requestsToServe.Lock()
-		if !w.s.requestsToServe.emptyLocked() {
-			// If we already have minTargetBytes set on the first request to be
-			// issued, then use that.
-			atLeastBytes = w.s.requestsToServe.nextLocked().minTargetBytes
-			// The first request has the highest urgency among all current
-			// requests to serve, so we use its priority to spill everything
-			// with less urgency when necessary to free up the budget.
-			spillingPriority = w.s.requestsToServe.nextLocked().priority()
-		}
+		// The coordinator goroutine is the only one that removes requests from
+		// w.s.requestsToServe, so we can keep the reference to next request
+		// without holding the lock.
+		//
+		// Note that it's possible that by the time we get into
+		// issueRequestsForAsyncProcessing() another request with higher urgency
+		// is added; however, this is not a problem - we wait for available
+		// budget here on a best-effort basis.
+		nextReq := w.s.requestsToServe.nextLocked()
 		w.s.requestsToServe.Unlock()
+		// If we already have minTargetBytes set on the first request to be
+		// issued, then use that.
+		atLeastBytes := nextReq.minTargetBytes
+		// The first request has the highest urgency among all current requests
+		// to serve, so we use its priority to spill everything with less
+		// urgency when necessary to free up the budget.
+		spillingPriority := nextReq.priority()
 
 		avgResponseSize, shouldExit := w.getAvgResponseSize()
 		if shouldExit {
@@ -916,7 +957,8 @@ func (w *workerCoordinator) logStatistics(ctx context.Context) {
 }
 
 // waitForRequests blocks until there is at least one request to be served.
-func (w *workerCoordinator) waitForRequests(ctx context.Context) error {
+// Boolean indicating whether the coordinator should exit is returned.
+func (w *workerCoordinator) waitForRequests(ctx context.Context) (shouldExit bool) {
 	w.s.requestsToServe.Lock()
 	defer w.s.requestsToServe.Unlock()
 	if w.s.requestsToServe.emptyLocked() {
@@ -924,21 +966,21 @@ func (w *workerCoordinator) waitForRequests(ctx context.Context) error {
 		// Check if the Streamer has been canceled or closed while we were
 		// waiting.
 		if ctx.Err() != nil {
-			return ctx.Err()
+			w.s.results.setError(ctx.Err())
+			return true
 		}
 		w.s.mu.Lock()
-		shouldExit := w.s.results.error() != nil || w.s.mu.done
+		shouldExit = w.s.results.error() != nil || w.s.mu.done
 		w.s.mu.Unlock()
 		if shouldExit {
-			return nil
+			return true
 		}
-		if buildutil.CrdbTestBuild {
-			if w.s.requestsToServe.emptyLocked() {
-				panic(errors.AssertionFailedf("unexpectedly zero requests to serve after waiting "))
-			}
+		if w.s.requestsToServe.emptyLocked() {
+			w.s.results.setError(errors.AssertionFailedf("unexpectedly zero requests to serve after waiting"))
+			return true
 		}
 	}
-	return nil
+	return false
 }
 
 func (w *workerCoordinator) getAvgResponseSize() (avgResponseSize int64, shouldExit bool) {
@@ -1052,6 +1094,30 @@ func (w *workerCoordinator) issueRequestsForAsyncProcessing(
 	)
 	var budgetIsExhausted bool
 	for !w.s.requestsToServe.emptyLocked() && maxNumRequestsToIssue > 0 && !budgetIsExhausted {
+		if !headOfLine && w.s.budget.mu.acc.Used() > w.s.eagerMemUsageLimitBytes {
+			// The next batch is not head-of-the-line, and the budget has used
+			// up more than eagerMemUsageLimitBytes bytes. At this point, we
+			// stop issuing "eager" requests, so we just exit.
+			//
+			// This exit will not lead to the streamer deadlocking because we
+			// already have at least one batch to serve, and at some point we'll
+			// get into this loop with headOfLine=true, so we'll always be
+			// issuing at least one batch, eventually.
+			//
+			// This behavior is helpful to prevent pathological behavior
+			// observed in #113729. Namely, if we issue too many batches eagerly
+			// in the InOrder mode, the buffered responses might consume most of
+			// our memory budget, and at some point we might regress to
+			// processing requests one batch with a single Get / Scan request at
+			// a time. We don't want to just drop already received responses
+			// (we've already discarded the original singleRangeBatches anyway),
+			// so this mechanism allows us to preserve a fraction of the budget
+			// to processing head-of-the-line batches.
+			//
+			// Similar pattern can occur in the OutOfOrder mode too although the
+			// degradation is not as severe as in the InOrder mode.
+			return nil
+		}
 		singleRangeReqs := w.s.requestsToServe.nextLocked()
 		availableBudget := w.s.budget.limitBytes - w.s.budget.mu.acc.Used()
 		// minTargetBytes is the minimum TargetBytes limit with which it makes
@@ -1116,6 +1182,18 @@ func (w *workerCoordinator) issueRequestsForAsyncProcessing(
 		// significantly in size.
 		if targetBytes < singleRangeReqs.minTargetBytes {
 			targetBytes = singleRangeReqs.minTargetBytes
+		}
+		if headOfLine && w.s.budget.mu.acc.Used() > w.s.eagerMemUsageLimitBytes {
+			// Given that the eager memory usage limit has already been
+			// exceeded, we won't issue any more requests for now, so rather
+			// than use the estimate on the response size, this head-of-the-line
+			// batch will use most of the available budget, as controlled by the
+			// session variable.
+			if headOfLineOnly := int64(float64(availableBudget) * w.s.headOfLineOnlyFraction); headOfLineOnly > targetBytes {
+				targetBytes = headOfLineOnly
+				// Ensure that we won't issue any more requests for now.
+				budgetIsExhausted = true
+			}
 		}
 		if targetBytes+responsesOverhead > availableBudget {
 			// We don't have enough budget to account for both the TargetBytes

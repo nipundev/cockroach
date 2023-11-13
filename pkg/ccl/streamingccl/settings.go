@@ -107,6 +107,14 @@ var ReplanFrequency = settings.RegisterDurationSetting(
 	settings.WithName("physical_replication.consumer.replan_flow_frequency"),
 )
 
+var InterNodeLag = settings.RegisterDurationSetting(
+	settings.SystemOnly,
+	"physical_replication.consumer.node_lag_replanning_threshold",
+	"the maximum difference in lag tolerated across two destination nodes; if 0, disabled",
+	0,
+	settings.NonNegativeDuration,
+)
+
 // DumpFrontierEntries controls the frequency at which we persist the entries in
 // the frontier to the `system.job_info` table.
 //
@@ -118,4 +126,15 @@ var DumpFrontierEntries = settings.RegisterDurationSetting(
 	"controls the frequency with which the frontier entries are persisted; if 0, disabled",
 	0,
 	settings.NonNegativeDuration,
+)
+
+// ReplicateSpanConfigsEnabled controls whether we replicate span
+// configurations from the source system tenant to the destination system
+// tenant.
+var ReplicateSpanConfigsEnabled = settings.RegisterBoolSetting(
+	settings.SystemOnly,
+	"physical_replication.consumer.span_configs.enabled",
+	"controls whether we replicate span configurations from the source system tenant to the "+
+		"destination system tenant",
+	true,
 )

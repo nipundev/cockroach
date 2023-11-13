@@ -534,6 +534,7 @@ func (c *SyncedCluster) kill(
 		// awk process match its own output from `ps`.
 		cmd := fmt.Sprintf(`
 mkdir -p %[1]s
+mkdir -p %[2]s
 echo ">>> roachprod %[1]s: $(date)" >> %[2]s/roachprod.log
 ps axeww -o pid -o command >> %[2]s/roachprod.log
 pids=$(ps axeww -o pid -o command | \
@@ -2972,8 +2973,8 @@ func (c *SyncedCluster) Init(ctx context.Context, l *logger.Logger, node Node) e
 		return errors.WithDetail(errors.CombineErrors(err, res.Err), "install.Init() failed: unable to initialize cluster.")
 	}
 
-	if res, err := c.setClusterSettings(ctx, l, node, ""); err != nil || (res != nil && res.Err != nil) {
-		return errors.WithDetail(errors.CombineErrors(err, res.Err), "install.Init() failed: unable to set cluster settings.")
+	if err := c.setClusterSettings(ctx, l, node, ""); err != nil {
+		return errors.WithDetail(err, "install.Init() failed: unable to set cluster settings.")
 	}
 
 	return nil

@@ -493,7 +493,6 @@ func (rd *replicationDriver) setupC2C(
 		require.NotEqual(t, "", rd.rs.multiregion.workloadNodeZone)
 	}
 
-	c.Put(ctx, t.Cockroach(), "./cockroach")
 	srcCluster := c.Range(1, rd.rs.srcNodes)
 	dstCluster := c.Range(rd.rs.srcNodes+1, rd.rs.srcNodes+rd.rs.dstNodes)
 	workloadNode := c.Node(rd.rs.srcNodes + rd.rs.dstNodes + 1)
@@ -1218,11 +1217,17 @@ func registerClusterToCluster(r registry.Registry) {
 			pdSize:             100,
 			workload:           replicateBulkOps{},
 			timeout:            2 * time.Hour,
-			cutoverTimeout:     1 * time.Hour,
 			additionalDuration: 0,
-			cutover:            5 * time.Minute,
+			// Cutover currently takes around 4 minutes, perhaps because we need to
+			// revert 10 GB of replicated data.
+			//
+			// TODO(msbutler): investigate further if cutover can be sped up.
+			cutoverTimeout: 10 * time.Minute,
+			cutover:        5 * time.Minute,
+			// In a few ad hoc runs, the max latency hikes up to 27 minutes before lag
+			// replanning and distributed catch up scans fix the poor initial plan. If
+			// max accepted latency doubles, then there's likely a regression.
 			maxAcceptedLatency: 1 * time.Hour,
-			skip:               "Reveals a bad bug related to replicating an import. See https://github.com/cockroachdb/cockroach/issues/105676 ",
 			clouds:             registry.AllExceptAWS,
 			suites:             registry.Suites("nightly"),
 		},
@@ -1244,6 +1249,7 @@ func registerClusterToCluster(r registry.Registry) {
 			skipNodeDistributionCheck: true,
 			clouds:                    registry.AllExceptAWS,
 			suites:                    registry.Suites("nightly"),
+			skip:                      "used for debugging when the full test fails",
 		},
 	} {
 		sp := sp
@@ -1745,7 +1751,8 @@ func srcClusterSettings(t test.Test, db *sqlutils.SQLRunner) {
 func destClusterSettings(t test.Test, db *sqlutils.SQLRunner, additionalDuration time.Duration) {
 	db.ExecMultiple(t, `SET CLUSTER SETTING cross_cluster_replication.enabled = true;`,
 		`SET CLUSTER SETTING kv.rangefeed.enabled = true;`,
-		`SET CLUSTER SETTING stream_replication.replan_flow_threshold = 0.1;`)
+		`SET CLUSTER SETTING stream_replication.replan_flow_threshold = 0.1;`,
+		`SET CLUSTER SETTING physical_replication.consumer.node_lag_replanning_threshold = '10m';`)
 
 	if additionalDuration != 0 {
 		replanFrequency := additionalDuration / 2

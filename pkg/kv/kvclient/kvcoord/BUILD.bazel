@@ -73,6 +73,7 @@ go_library(
         "//pkg/util/grpcutil",
         "//pkg/util/hlc",
         "//pkg/util/iterutil",
+        "//pkg/util/limit",
         "//pkg/util/log",
         "//pkg/util/metric",
         "//pkg/util/pprofutil",
@@ -149,7 +150,6 @@ go_test(
         "txn_test.go",
         ":mock_kvcoord",  # keep
     ],
-    args = ["-test.timeout=295s"],
     data = glob(["testdata/**"]),
     embed = [":kvcoord"],
     shard_count = 16,

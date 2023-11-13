@@ -1777,6 +1777,9 @@ type StreamingTestingKnobs struct {
 	// a single event has been received.
 	RunAfterReceivingEvent func(ctx context.Context) error
 
+	// ElideCheckpointEvent elides checkpoint event ingestion if this returns true
+	ElideCheckpointEvent func(nodeId base.SQLInstanceID, frontier hlc.Timestamp) bool
+
 	// BeforeClientSubscribe allows observation of parameters about to be passed
 	// to a streaming client
 	BeforeClientSubscribe func(addr string, token string, startTime hlc.Timestamp)
@@ -3642,6 +3645,18 @@ func (m *sessionDataMutator) SetStreamerAlwaysMaintainOrdering(val bool) {
 	m.data.StreamerAlwaysMaintainOrdering = val
 }
 
+func (m *sessionDataMutator) SetStreamerInOrderEagerMemoryUsageFraction(val float64) {
+	m.data.StreamerInOrderEagerMemoryUsageFraction = val
+}
+
+func (m *sessionDataMutator) SetStreamerOutOfOrderEagerMemoryUsageFraction(val float64) {
+	m.data.StreamerOutOfOrderEagerMemoryUsageFraction = val
+}
+
+func (m *sessionDataMutator) SetStreamerHeadOfLineOnlyFraction(val float64) {
+	m.data.StreamerHeadOfLineOnlyFraction = val
+}
+
 func (m *sessionDataMutator) SetMultipleActivePortalsEnabled(val bool) {
 	m.data.MultipleActivePortalsEnabled = val
 }
@@ -3680,6 +3695,10 @@ func (m *sessionDataMutator) SetOptimizerUseLockOpForSerializable(val bool) {
 
 func (m *sessionDataMutator) SetOptimizerUseProvidedOrderingFix(val bool) {
 	m.data.OptimizerUseProvidedOrderingFix = val
+}
+
+func (m *sessionDataMutator) SetDisableChangefeedReplication(val bool) {
+	m.data.DisableChangefeedReplication = val
 }
 
 // Utility functions related to scrubbing sensitive information on SQL Stats.

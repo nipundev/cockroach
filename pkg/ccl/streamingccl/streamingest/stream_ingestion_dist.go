@@ -149,6 +149,10 @@ func startDistIngestion(
 
 	spanConfigIngestStopper := make(chan struct{})
 	streamSpanConfigs := func(ctx context.Context) error {
+		if !streamingccl.ReplicateSpanConfigsEnabled.Get(&execCtx.ExecCfg().Settings.SV) {
+			log.Warningf(ctx, "span config replication is disabled")
+			return nil
+		}
 		if knobs := execCtx.ExecCfg().StreamingTestingKnobs; knobs != nil && knobs.SkipSpanConfigReplication {
 			return nil
 		}
@@ -740,6 +744,7 @@ func constructStreamIngestionPlanSpecs(
 		StreamAddresses:         topology.StreamAddresses(),
 		SubscribingSQLInstances: subscribingSQLInstances,
 		Checkpoint:              checkpoint,
+		PartitionSpecs:          repackagePartitionSpecs(streamIngestionSpecs),
 	}
 
 	return streamIngestionSpecs, streamIngestionFrontierSpec, nil

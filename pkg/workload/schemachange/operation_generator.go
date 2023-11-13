@@ -158,9 +158,8 @@ func (og *operationGenerator) getSupportedDeclarativeOp(
 ) (opType, error) {
 	for {
 		op := opType(og.params.declarativeOps.Int())
-		if !clusterversion.TestingBinaryMinSupportedVersion.Equal(
-			clusterversion.ByKey(opDeclarativeVersion[op])) {
-			notSupported, err := isClusterVersionLessThan(ctx, tx, clusterversion.ByKey(opDeclarativeVersion[op]))
+		if opVerKey := opDeclarativeVersion[op]; opVerKey != clusterversion.MinSupported {
+			notSupported, err := isClusterVersionLessThan(ctx, tx, opVerKey.Version())
 			if err != nil {
 				return op, err
 			}
@@ -2667,6 +2666,31 @@ func makeOpStmt(queryType opStmtType) *opStmt {
 	return &opStmt{
 		queryType:           queryType,
 		expectedExecErrors:  makeExpectedErrorSet(),
+		potentialExecErrors: makeExpectedErrorSet(),
+	}
+}
+
+// opStmtFromTree constructs an operation from the provide tree.Statement.
+//
+//lint:ignore U1000 Used in future commits. TODO(chrisseto): Remove the ignore.
+func newOpStmt(stmt tree.Statement, expectedExecErrors codesWithConditions) *opStmt {
+	var queryType opStmtType
+	switch stmt.StatementType() {
+	case tree.TypeDDL:
+		queryType = OpStmtDDL
+	case tree.TypeDML:
+		queryType = OpStmtDML
+	default:
+		panic("unhandled statement type")
+	}
+
+	expectedErrors := makeExpectedErrorSet()
+	expectedErrors.addAll(expectedExecErrors)
+
+	return &opStmt{
+		sql:                 tree.Serialize(stmt),
+		queryType:           queryType,
+		expectedExecErrors:  expectedErrors,
 		potentialExecErrors: makeExpectedErrorSet(),
 	}
 }

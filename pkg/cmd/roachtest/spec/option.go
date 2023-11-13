@@ -19,13 +19,6 @@ import (
 // Option for MakeClusterSpec.
 type Option func(spec *ClusterSpec)
 
-// Cloud controls what cloud is used to create the cluster.
-func Cloud(s string) Option {
-	return func(spec *ClusterSpec) {
-		spec.Cloud = s
-	}
-}
-
 // Arch requests a specific CPU architecture.
 //
 // Note that it is not guaranteed that this architecture will be used (e.g. if
@@ -182,6 +175,19 @@ func DisableLocalSSD() Option {
 func TerminateOnMigration() Option {
 	return func(spec *ClusterSpec) {
 		spec.TerminateOnMigration = true
+	}
+}
+
+// UseSpotInstances creates a spot instance or equivalent of a cloud provider.
+// Using this option creates SpotVMs instead of on demand VMS. SpotVMS are
+// cheaper but can be terminated at any time by the cloud provider.
+// This option is only supported by GCE for now.
+// See https://cloud.google.com/compute/docs/instances/spot,
+// https://azure.microsoft.com/en-in/products/virtual-machines/spot
+// and https://aws.amazon.com/ec2/spot/ for more details.
+func UseSpotInstances() Option {
+	return func(spec *ClusterSpec) {
+		spec.UseSpot = true
 	}
 }
 

@@ -54,6 +54,7 @@ default_transaction_read_only                              off
 default_transaction_use_follower_reads                     off
 default_with_oids                                          off
 descriptor_validation                                      on
+disable_changefeed_replication                             off
 disable_hoist_projection_in_join_limitation                off
 disable_partially_distributed_plans                        off
 disable_plan_gists                                         off
@@ -152,6 +153,9 @@ standard_conforming_strings                                on
 statement_timeout                                          0
 streamer_always_maintain_ordering                          off
 streamer_enabled                                           on
+streamer_head_of_line_only_fraction                        0.8
+streamer_in_order_eager_memory_usage_fraction              0.5
+streamer_out_of_order_eager_memory_usage_fraction          0.8
 strict_ddl_atomicity                                       off
 stub_catalog_tables                                        on
 synchronize_seqscans                                       on

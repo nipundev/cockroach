@@ -40,6 +40,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/roachtestutil"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/spec"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/test"
+	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/tests"
 	"github.com/cockroachdb/cockroach/pkg/roachprod"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/config"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/install"
@@ -48,7 +49,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachprod/vm"
 	"github.com/cockroachdb/cockroach/pkg/util/httputil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
-	"github.com/cockroachdb/cockroach/pkg/util/quotapool"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
@@ -621,10 +621,11 @@ type nodeSelector interface {
 
 // It is safe for concurrent use by multiple goroutines.
 type clusterImpl struct {
-	name string
-	tag  string
-	spec spec.ClusterSpec
-	t    test.Test
+	name  string
+	tag   string
+	cloud string
+	spec  spec.ClusterSpec
+	t     test.Test
 	// r is the registry tracking this cluster. Destroying the cluster will
 	// unregister it.
 	r *clusterRegistry
@@ -691,10 +692,6 @@ type destroyState struct {
 	// If not set, Destroy() only wipes the cluster.
 	owned bool
 
-	// alloc is set if owned is set. If set, it represents resources in a
-	// QuotaPool that need to be released when the cluster is destroyed.
-	alloc *quotapool.IntAlloc
-
 	mu struct {
 		syncutil.Mutex
 		loggerClosed bool
@@ -733,7 +730,6 @@ type clusterConfig struct {
 	username     string
 	localCluster bool
 	useIOBarrier bool
-	alloc        *quotapool.IntAlloc
 	// Specifies CPU architecture which may require a custom AMI and cockroach binary.
 	arch vm.CPUArch
 	// Specifies the OS which may require a custom AMI and cockroach binary.
@@ -853,10 +849,6 @@ func (f *clusterFactory) newCluster(
 		}
 		return c, nil, nil
 	}
-	// Ensure an allocation is specified.
-	if cfg.alloc == nil {
-		return nil, nil, errors.New("no allocation specified; cfg.alloc must be set")
-	}
 
 	if cfg.localCluster {
 		// Local clusters never expire.
@@ -872,7 +864,9 @@ func (f *clusterFactory) newCluster(
 
 	providerOptsContainer := vm.CreateProviderOptionsContainer()
 
+	cloud := roachtestflags.Cloud
 	params := spec.RoachprodClusterConfig{
+		Cloud:                  cloud,
 		UseIOBarrierOnLocalSSD: cfg.useIOBarrier,
 		PreferredArch:          cfg.arch,
 	}
@@ -884,13 +878,10 @@ func (f *clusterFactory) newCluster(
 	// that each create attempt gets a unique cluster name.
 	createVMOpts, providerOpts, err := cfg.spec.RoachprodOpts(params)
 	if err != nil {
-		// We must release the allocation because cluster creation is not possible at this point.
-		cfg.alloc.Release()
-
 		return nil, nil, err
 	}
-	if cfg.spec.Cloud != spec.Local {
-		providerOptsContainer.SetProviderOpts(cfg.spec.Cloud, providerOpts)
+	if cloud != spec.Local {
+		providerOptsContainer.SetProviderOpts(cloud, providerOpts)
 	}
 
 	if cfg.spec.UbuntuVersion.IsOverridden() {
@@ -929,6 +920,7 @@ func (f *clusterFactory) newCluster(
 		}
 
 		c := &clusterImpl{
+			cloud:      cloud,
 			name:       genName,
 			spec:       cfg.spec,
 			expiration: cfg.spec.Expiration(),
@@ -937,7 +929,6 @@ func (f *clusterFactory) newCluster(
 			os:         cfg.os,
 			destroyState: destroyState{
 				owned: true,
-				alloc: cfg.alloc,
 			},
 			l: l,
 		}
@@ -963,14 +954,8 @@ func (f *clusterFactory) newCluster(
 		}
 
 		l.PrintfCtx(ctx, "cluster creation failed, cleaning up in case it was partially created: %s", err)
-		// Set the alloc to nil so that Destroy won't release it.
-		// This is ugly, but given that the alloc is created very far away from this code
-		// (when selecting the test) it's the best we can do for now.
-		c.destroyState.alloc = nil
 		c.Destroy(ctx, closeLogger, l)
 		if i >= maxAttempts {
-			// Here we have to release the alloc, as we are giving up.
-			cfg.alloc.Release()
 			return nil, nil, err
 		}
 		// Try again to create the cluster.
@@ -1074,10 +1059,6 @@ func (c *clusterImpl) StopCockroachGracefullyOnNode(
 // Save marks the cluster as "saved" so that it doesn't get destroyed.
 func (c *clusterImpl) Save(ctx context.Context, msg string, l *logger.Logger) {
 	l.PrintfCtx(ctx, "saving cluster %s for debugging (--debug specified)", c)
-	// TODO(andrei): should we extend the cluster here? For how long?
-	if c.destroyState.owned && c.destroyState.alloc != nil { // we won't have an alloc for an unowned cluster
-		c.destroyState.alloc.Freeze()
-	}
 	c.r.markClusterAsSaved(c, msg)
 	c.destroyState.mu.Lock()
 	c.destroyState.mu.saved = true
@@ -1687,13 +1668,6 @@ func (c *clusterImpl) doDestroy(ctx context.Context, l *logger.Logger) <-chan st
 			} else {
 				l.PrintfCtx(ctx, "destroying cluster %s... done", c)
 			}
-			if c.destroyState.alloc != nil {
-				// We should usually have an alloc here, but if we're getting into this
-				// code path while retrying cluster creation, we don't want the alloc
-				// to be released (as we're going to retry cluster creation) and it will
-				// be nil here.
-				c.destroyState.alloc.Release()
-			}
 		} else {
 			l.PrintfCtx(ctx, "wiping cluster %s", c)
 			c.status("wiping cluster")
@@ -1780,16 +1754,25 @@ func (c *clusterImpl) PutE(
 	return errors.Wrap(roachprod.Put(ctx, l, c.MakeNodes(nodes...), src, dest, true /* useTreeDist */), "cluster.PutE")
 }
 
-// PutDefaultCockroach uploads the cockroach binary passed in the
-// command line to `test.DefaultCockroachPath` in every node in the
-// cluster. This binary is used by the test runner to collect failure
-// artifacts since tests are free to upload the cockroach binary they
-// use to any location they desire.
-func (c *clusterImpl) PutDefaultCockroach(
-	ctx context.Context, l *logger.Logger, cockroachPath string,
-) error {
-	c.status("uploading default cockroach binary to nodes")
-	return c.PutE(ctx, l, cockroachPath, test.DefaultCockroachPath, c.All())
+// PutCockroach checks if a test specifies a cockroach binary to upload to all
+// nodes in the cluster. By default, we randomly upload a binary with or without
+// runtime assertions enabled. Note that we upload to all nodes even if they
+// don't use the binary, so that the test runner can always fetch logs.
+func (c *clusterImpl) PutCockroach(ctx context.Context, l *logger.Logger, t *testImpl) error {
+	switch t.spec.CockroachBinary {
+	case registry.RandomizedCockroach:
+		if tests.UsingRuntimeAssertions(t) {
+			t.l.Printf("To reproduce the same set of metamorphic constants, run this test with %s=%d", test.EnvAssertionsEnabledSeed, c.cockroachRandomSeed())
+		}
+		return c.PutE(ctx, l, t.Cockroach(), test.DefaultCockroachPath, c.All())
+	case registry.StandardCockroach:
+		return c.PutE(ctx, l, t.StandardCockroach(), test.DefaultCockroachPath, c.All())
+	case registry.RuntimeAssertionsCockroach:
+		t.l.Printf("To reproduce the same set of metamorphic constants, run this test with %s=%d", test.EnvAssertionsEnabledSeed, c.cockroachRandomSeed())
+		return c.PutE(ctx, l, t.RuntimeAssertionsCockroach(), test.DefaultCockroachPath, c.All())
+	default:
+		return errors.Errorf("Specified cockroach binary does not exist.")
+	}
 }
 
 // PutLibraries inserts the specified libraries, by name, into all nodes on the cluster
@@ -2615,7 +2598,7 @@ func (c *clusterImpl) MakeNodes(opts ...option.Option) string {
 }
 
 func (c *clusterImpl) Cloud() string {
-	return c.spec.Cloud
+	return c.cloud
 }
 
 func (c *clusterImpl) IsLocal() bool {
@@ -2697,7 +2680,7 @@ func archForTest(ctx context.Context, l *logger.Logger, testSpec registry.TestSp
 		return testSpec.Cluster.Arch
 	}
 
-	if testSpec.Benchmark && testSpec.Cluster.Cloud != spec.Local {
+	if testSpec.Benchmark && roachtestflags.Cloud != spec.Local {
 		// TODO(srosenberg): enable after https://github.com/cockroachdb/cockroach/issues/104213
 		arch := vm.ArchAMD64
 		l.PrintfCtx(ctx, "Disabling arch randomization for benchmark; arch=%q, %s", arch, testSpec.Name)

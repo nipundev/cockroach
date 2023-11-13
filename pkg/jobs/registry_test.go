@@ -115,7 +115,7 @@ func TestRegistryGC(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
-	s, sqlDB, kvDB := serverutils.StartServer(t, base.TestServerArgs{
+	srv, sqlDB, kvDB := serverutils.StartServer(t, base.TestServerArgs{
 		Knobs: base.TestingKnobs{
 			SpanConfig: &spanconfig.TestingKnobs{
 				// This test directly modifies `system.jobs` and makes over its contents
@@ -137,7 +137,8 @@ func TestRegistryGC(t *testing.T) {
 			JobsTestingKnobs: NewTestingKnobsWithShortIntervals(),
 		},
 	})
-	defer s.Stopper().Stop(ctx)
+	defer srv.Stopper().Stop(ctx)
+	s := srv.ApplicationLayer()
 
 	db := sqlutils.MakeSQLRunner(sqlDB)
 
@@ -243,9 +244,13 @@ INSERT INTO t."%s" VALUES('a', 'foo');
 				{sqlActivityJob}, {oldRunningJob}, {oldSucceededJob}, {oldFailedJob}, {oldRevertFailedJob}, {oldCanceledJob},
 				{newRunningJob}, {newSucceededJob}, {newFailedJob}, {newRevertFailedJob}, {newCanceledJob}})
 
-			if err := s.JobRegistry().(*Registry).cleanupOldJobs(ctx, earlier); err != nil {
-				t.Fatal(err)
-			}
+			testutils.SucceedsSoon(t, func() error {
+				if err := s.JobRegistry().(*Registry).cleanupOldJobs(ctx, earlier); err != nil {
+					return err
+				}
+				return nil
+			})
+
 			db.CheckQueryResults(t, `SELECT id FROM system.jobs ORDER BY id`, [][]string{
 				{sqlActivityJob}, {oldRunningJob}, {oldRevertFailedJob}, {newRunningJob},
 				{newSucceededJob}, {newFailedJob}, {newRevertFailedJob}, {newCanceledJob}})
@@ -269,7 +274,7 @@ func TestRegistryGCPagination(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 	ctx := context.Background()
-	s, sqlDB, _ := serverutils.StartServer(t, base.TestServerArgs{
+	srv, sqlDB, _ := serverutils.StartServer(t, base.TestServerArgs{
 		Knobs: base.TestingKnobs{
 			SpanConfig: &spanconfig.TestingKnobs{
 				// This test directly modifies `system.jobs` and makes over its contents
@@ -293,7 +298,8 @@ func TestRegistryGCPagination(t *testing.T) {
 		},
 	})
 	db := sqlutils.MakeSQLRunner(sqlDB)
-	defer s.Stopper().Stop(ctx)
+	defer srv.Stopper().Stop(ctx)
+	s := srv.ApplicationLayer()
 
 	for i := 0; i < 2*cleanupPageSize+1; i++ {
 		payload, err := protoutil.Marshal(&jobspb.Payload{})
@@ -597,7 +603,7 @@ func TestRetriesWithExponentialBackoff(t *testing.T) {
 
 	// createJob creates a mock job.
 	createJob := func(
-		ctx context.Context, s serverutils.TestServerInterface, r *Registry, tdb *sqlutils.SQLRunner, db isql.DB,
+		t *testing.T, ctx context.Context, s serverutils.ApplicationLayerInterface, r *Registry, tdb *sqlutils.SQLRunner, db isql.DB,
 	) (jobspb.JobID, time.Time) {
 		jobID := r.MakeJobID()
 		require.NoError(t, db.Txn(ctx, func(ctx context.Context, txn isql.Txn) error {
@@ -653,7 +659,7 @@ func TestRetriesWithExponentialBackoff(t *testing.T) {
 	}
 
 	type BackoffTestInfra struct {
-		s                        serverutils.TestServerInterface
+		s                        serverutils.ApplicationLayerInterface
 		tdb                      *sqlutils.SQLRunner
 		kvDB                     *kv.DB
 		idb                      isql.DB
@@ -672,7 +678,7 @@ func TestRetriesWithExponentialBackoff(t *testing.T) {
 		// resumption on retry, such as after pausing and resuming job.
 		expectImmediateRetry bool
 	}
-	testInfraSetUp := func(ctx context.Context, bti *BackoffTestInfra) func() {
+	testInfraSetUp := func(t *testing.T, ctx context.Context, bti *BackoffTestInfra) func() {
 		// We use a manual clock to control and evaluate job execution times.
 		// We initialize the clock with Now() because the job-creation timestamp,
 		// 'created' column in system.jobs, of a new job is set from txn's time.
@@ -710,13 +716,15 @@ func TestRetriesWithExponentialBackoff(t *testing.T) {
 			},
 		}
 		var sqlDB *gosql.DB
-		bti.s, sqlDB, bti.kvDB = serverutils.StartServer(t, args)
+		var srv serverutils.TestServerInterface
+		srv, sqlDB, bti.kvDB = serverutils.StartServer(t, args)
 		cleanup := func() {
 			close(bti.errCh)
 			close(bti.resumeCh)
 			close(bti.failOrCancelCh)
-			bti.s.Stopper().Stop(ctx)
+			srv.Stopper().Stop(ctx)
 		}
+		bti.s = srv.ApplicationLayer()
 		bti.idb = bti.s.InternalDB().(isql.DB)
 		bti.tdb = sqlutils.MakeSQLRunner(sqlDB)
 		bti.registry = bti.s.JobRegistry().(*Registry)
@@ -840,11 +848,11 @@ func TestRetriesWithExponentialBackoff(t *testing.T) {
 			}
 			bti.transitionCh <- struct{}{}
 		}
-		cleanup := testInfraSetUp(ctx, &bti)
+		cleanup := testInfraSetUp(t, ctx, &bti)
 		defer cleanup()
 
 		jobID, lastRun := createJob(
-			ctx, bti.s, bti.registry, bti.tdb, bti.idb,
+			t, ctx, bti.s, bti.registry, bti.tdb, bti.idb,
 		)
 		retryCnt := 0
 		expectedResumed := int64(0)
@@ -864,12 +872,13 @@ func TestRetriesWithExponentialBackoff(t *testing.T) {
 			}
 			bti.transitionCh <- struct{}{}
 		}
-		cleanup := testInfraSetUp(ctx, &bti)
+		cleanup := testInfraSetUp(t, ctx, &bti)
 		defer cleanup()
 
-		jobID, lastRun := createJob(ctx, bti.s, bti.registry, bti.tdb, bti.idb)
+		jobID, lastRun := createJob(t, ctx, bti.s, bti.registry, bti.tdb, bti.idb)
 		retryCnt := 0
 		expectedResumed := int64(0)
+
 		runTest(t, jobID, retryCnt, expectedResumed, lastRun, &bti, func(_ int64) {
 			<-bti.resumeCh
 			insqlDB := bti.s.InternalDB().(isql.DB)
@@ -889,11 +898,11 @@ func TestRetriesWithExponentialBackoff(t *testing.T) {
 			}
 			bti.transitionCh <- struct{}{}
 		}
-		cleanup := testInfraSetUp(ctx, &bti)
+		cleanup := testInfraSetUp(t, ctx, &bti)
 		defer cleanup()
 
 		jobID, lastRun := createJob(
-			ctx, bti.s, bti.registry, bti.tdb, bti.idb,
+			t, ctx, bti.s, bti.registry, bti.tdb, bti.idb,
 		)
 		bti.clock.AdvanceTo(lastRun)
 		<-bti.resumeCh
@@ -913,11 +922,11 @@ func TestRetriesWithExponentialBackoff(t *testing.T) {
 	t.Run("revert on cancel", func(t *testing.T) {
 		ctx := context.Background()
 		bti := BackoffTestInfra{}
-		cleanup := testInfraSetUp(ctx, &bti)
+		cleanup := testInfraSetUp(t, ctx, &bti)
 		defer cleanup()
 
 		jobID, lastRun := createJob(
-			ctx, bti.s, bti.registry, bti.tdb, bti.idb,
+			t, ctx, bti.s, bti.registry, bti.tdb, bti.idb,
 		)
 		bti.clock.AdvanceTo(lastRun)
 		<-bti.resumeCh
@@ -944,11 +953,11 @@ func TestRetriesWithExponentialBackoff(t *testing.T) {
 			}
 			bti.transitionCh <- struct{}{}
 		}
-		cleanup := testInfraSetUp(ctx, &bti)
+		cleanup := testInfraSetUp(t, ctx, &bti)
 		defer cleanup()
 
 		jobID, lastRun := createJob(
-			ctx, bti.s, bti.registry, bti.tdb, bti.idb,
+			t, ctx, bti.s, bti.registry, bti.tdb, bti.idb,
 		)
 		bti.clock.AdvanceTo(lastRun)
 		<-bti.resumeCh

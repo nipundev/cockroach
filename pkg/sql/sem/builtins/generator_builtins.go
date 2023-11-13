@@ -23,6 +23,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/sql/lexbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/workloadindexrec"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
@@ -63,6 +64,18 @@ func init() {
 		registerBuiltin(k, v, tree.GeneratorClass, enforceClass)
 	}
 }
+
+const DefaultSpanStatsSpanLimit = 1000
+
+// SpanStatsBatchLimit registers the maximum number of spans allowed in a
+// span stats request payload.
+var SpanStatsBatchLimit = settings.RegisterIntSetting(
+	settings.ApplicationLevel,
+	"server.span_stats.span_batch_limit",
+	"the maximum number of spans allowed in a request payload for span statistics",
+	DefaultSpanStatsSpanLimit,
+	settings.PositiveInt,
+)
 
 func genProps() tree.FunctionProperties {
 	return tree.FunctionProperties{
@@ -3291,14 +3304,16 @@ type storageInternalKeysIterator struct {
 
 var storageInternalKeysGeneratorType = types.MakeLabeledTuple(
 	[]*types.T{types.Int, types.Int, types.Int, types.Int, types.Int, types.Int, types.Int, types.Int,
-		types.Int, types.Int},
+		types.Int, types.Int, types.Int, types.Int},
 	[]string{
 		"level",
 		"node_id",
 		"store_id",
 		"snapshot_pinned_keys",
 		"snapshot_pinned_keys_bytes",
+		"point_key_delete_is_latest_count",
 		"point_key_delete_count",
+		"point_key_set_is_latest_count",
 		"point_key_set_count",
 		"range_delete_count",
 		"range_key_set_count",
@@ -3346,7 +3361,9 @@ func (s *storageInternalKeysIterator) Values() (tree.Datums, error) {
 		tree.NewDInt(tree.DInt(s.storeID)),
 		tree.NewDInt(tree.DInt(metricsInfo.SnapshotPinnedKeys)),
 		tree.NewDInt(tree.DInt(metricsInfo.SnapshotPinnedKeysBytes)),
+		tree.NewDInt(tree.DInt(metricsInfo.PointKeyDeleteIsLatestCount)),
 		tree.NewDInt(tree.DInt(metricsInfo.PointKeyDeleteCount)),
+		tree.NewDInt(tree.DInt(metricsInfo.PointKeySetIsLatestCount)),
 		tree.NewDInt(tree.DInt(metricsInfo.PointKeySetCount)),
 		tree.NewDInt(tree.DInt(metricsInfo.RangeDeleteCount)),
 		tree.NewDInt(tree.DInt(metricsInfo.RangeKeySetCount)),
@@ -3418,7 +3435,7 @@ func makeTableSpanStatsGenerator(
 		}
 	}
 
-	spanBatchLimit := roachpb.SpanStatsBatchLimit.Get(&evalCtx.Settings.SV)
+	spanBatchLimit := SpanStatsBatchLimit.Get(&evalCtx.Settings.SV)
 	return newTableSpanStatsIterator(evalCtx, dbId, tableId,
 		int(spanBatchLimit)), nil
 }

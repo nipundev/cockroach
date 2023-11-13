@@ -37,7 +37,6 @@ go_test(
         "cockroach_versions_test.go",
         "setting_test.go",
     ],
-    args = ["-test.timeout=55s"],
     embed = [":clusterversion"],
     deps = [
         "//pkg/build",
@@ -46,7 +45,6 @@ go_test(
         "//pkg/settings/cluster",
         "//pkg/testutils",
         "//pkg/util/leaktest",
-        "//pkg/util/protoutil",
         "@com_github_cockroachdb_errors//:errors",
         "@com_github_cockroachdb_redact//:redact",
         "@com_github_stretchr_testify//require",
