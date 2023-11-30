@@ -17,7 +17,6 @@ go_library(
         "//pkg/sql/pgwire/pgerror",
         "//pkg/sql/sem/eval",
         "//pkg/sql/sem/tree",
-        "//pkg/util/uuid",
     ],
 )
 
@@ -71,6 +70,8 @@ go_test(
         "//pkg/sql/catalog/descpb",
         "//pkg/sql/catalog/descs",
         "//pkg/sql/catalog/desctestutils",
+        "//pkg/sql/catalog/lease",
+        "//pkg/sql/catalog/typedesc",
         "//pkg/sql/enum",
         "//pkg/sql/execinfra",
         "//pkg/sql/isql",
@@ -81,6 +82,7 @@ go_test(
         "//pkg/sql/sem/tree",
         "//pkg/sql/sqlinstance/instancestorage",
         "//pkg/sql/sqlliveness",
+        "//pkg/sql/sqlliveness/slinstance",
         "//pkg/sql/sqlliveness/slstorage",
         "//pkg/sql/sqltestutils",
         "//pkg/testutils",
@@ -95,6 +97,7 @@ go_test(
         "//pkg/util/log",
         "//pkg/util/quotapool",
         "//pkg/util/randutil",
+        "//pkg/util/retry",
         "//pkg/util/syncutil",
         "//pkg/util/timeutil",
         "//pkg/util/tracing",

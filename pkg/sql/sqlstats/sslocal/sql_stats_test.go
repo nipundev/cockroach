@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/obs"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
@@ -439,7 +440,7 @@ func TestExplicitTxnFingerprintAccounting(t *testing.T) {
 		nil /* curCount */, nil /* maxHist */, math.MaxInt64, st,
 	)
 
-	insightsProvider := insights.New(st, insights.NewMetrics())
+	insightsProvider := insights.New(st, insights.NewMetrics(), obs.NoopEventsExporter{})
 	sqlStats := sslocal.New(
 		st,
 		sqlstats.MaxMemSQLStatsStmtFingerprints,
@@ -570,7 +571,7 @@ func TestAssociatingStmtStatsWithTxnFingerprint(t *testing.T) {
 		require.NoError(t, err)
 
 		// Construct the SQL Stats machinery.
-		insightsProvider := insights.New(st, insights.NewMetrics())
+		insightsProvider := insights.New(st, insights.NewMetrics(), obs.NoopEventsExporter{})
 		sqlStats := sslocal.New(
 			st,
 			sqlstats.MaxMemSQLStatsStmtFingerprints,
@@ -688,7 +689,7 @@ func TestUnprivilegedUserReset(t *testing.T) {
 	defer s.Stopper().Stop(ctx)
 
 	sqlConn := sqlutils.MakeSQLRunner(conn)
-	sqlConn.Exec(t, "CREATE USER nonAdminUser")
+	sqlConn.Exec(t, "CREATE USER non_admin_user")
 
 	ie := s.InternalExecutor().(*sql.InternalExecutor)
 
@@ -697,7 +698,7 @@ func TestUnprivilegedUserReset(t *testing.T) {
 		"test-reset-sql-stats-as-non-admin-user",
 		nil, /* txn */
 		sessiondata.InternalExecutorOverride{
-			User: username.MakeSQLUsernameFromPreNormalizedString("nonAdminUser"),
+			User: username.MakeSQLUsernameFromPreNormalizedString("non_admin_user"),
 		},
 		"SELECT crdb_internal.reset_sql_stats()",
 	)

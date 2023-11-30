@@ -377,7 +377,7 @@ func checkPrivilegesForBackup(
 
 func requireEnterprise(execCfg *sql.ExecutorConfig, feature string) error {
 	if err := utilccl.CheckEnterpriseEnabled(
-		execCfg.Settings, execCfg.NodeInfo.LogicalClusterID(),
+		execCfg.Settings,
 		fmt.Sprintf("BACKUP with %s", feature),
 	); err != nil {
 		return err
@@ -604,6 +604,12 @@ func backupPlanHook(
 
 		if revisionHistory {
 			if err := requireEnterprise(p.ExecCfg(), "revision_history"); err != nil {
+				return err
+			}
+		}
+
+		if executionLocality.NonEmpty() {
+			if err := requireEnterprise(p.ExecCfg(), "execution locality"); err != nil {
 				return err
 			}
 		}

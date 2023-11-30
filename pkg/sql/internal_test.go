@@ -27,7 +27,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/desctestutils"
 	"github.com/cockroachdb/cockroach/pkg/sql/isql"
-	"github.com/cockroachdb/cockroach/pkg/sql/roleoption"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/catconstants"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
@@ -199,114 +198,6 @@ func TestInternalStmtFingerprintLimit(t *testing.T) {
 	)
 	_, err = ie.Exec(ctx, "stmt-exceeds-fingerprint-limit", nil, "SELECT 1")
 	require.NoError(t, err)
-}
-
-func TestQueryIsAdminWithNoTxn(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	defer log.Scope(t).Close(t)
-
-	ctx := context.Background()
-	params, _ := createTestServerParams()
-	s, db, _ := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop(ctx)
-
-	if _, err := db.Exec("create user testuser"); err != nil {
-		t.Fatal(err)
-	}
-
-	ie := s.InternalExecutor().(*sql.InternalExecutor)
-
-	testData := []struct {
-		user     username.SQLUsername
-		expAdmin bool
-	}{
-		{username.NodeUserName(), true},
-		{username.RootUserName(), true},
-		{username.TestUserName(), false},
-	}
-
-	for _, tc := range testData {
-		t.Run(tc.user.Normalized(), func(t *testing.T) {
-			row, cols, err := ie.QueryRowExWithCols(ctx, "test", nil, /* txn */
-				sessiondata.InternalExecutorOverride{User: tc.user},
-				"SELECT crdb_internal.is_admin()")
-			if err != nil {
-				t.Fatal(err)
-			}
-			if row == nil || len(cols) != 1 {
-				numRows := 0
-				if row != nil {
-					numRows = 1
-				}
-				t.Fatalf("unexpected result shape %d, %d", numRows, len(cols))
-			}
-			isAdmin := bool(*row[0].(*tree.DBool))
-			if isAdmin != tc.expAdmin {
-				t.Fatalf("expected %q admin %v, got %v", tc.user, tc.expAdmin, isAdmin)
-			}
-		})
-	}
-}
-
-func TestQueryHasRoleOptionWithNoTxn(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	defer log.Scope(t).Close(t)
-
-	ctx := context.Background()
-	params, _ := createTestServerParams()
-	s, db, _ := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop(ctx)
-
-	stmts := `
-CREATE USER testuser VIEWACTIVITY;
-CREATE USER testuserredacted VIEWACTIVITYREDACTED;
-CREATE USER testadmin;
-GRANT admin TO testadmin`
-	if _, err := db.Exec(stmts); err != nil {
-		t.Fatal(err)
-	}
-	ie := s.InternalExecutor().(*sql.InternalExecutor)
-
-	for _, tc := range []struct {
-		user        string
-		option      string
-		expected    bool
-		expectedErr string
-	}{
-		{"testuser", roleoption.VIEWACTIVITY.String(), true, ""},
-		{"testuser", roleoption.CREATEROLE.String(), false, ""},
-		{"testuser", "nonexistent", false, "unrecognized role option"},
-		{"testuserredacted", roleoption.VIEWACTIVITYREDACTED.String(), true, ""},
-		{"testuserredacted", roleoption.CREATEROLE.String(), false, ""},
-		{"testuserredacted", "nonexistent", false, "unrecognized role option"},
-		{"testadmin", roleoption.VIEWACTIVITY.String(), true, ""},
-		{"testadmin", roleoption.CREATEROLE.String(), true, ""},
-		{"testadmin", "nonexistent", false, "unrecognized role option"},
-	} {
-		username := username.MakeSQLUsernameFromPreNormalizedString(tc.user)
-		row, cols, err := ie.QueryRowExWithCols(ctx, "test", nil, /* txn */
-			sessiondata.InternalExecutorOverride{User: username},
-			"SELECT crdb_internal.has_role_option($1)", tc.option)
-		if tc.expectedErr != "" {
-			if !testutils.IsError(err, tc.expectedErr) {
-				t.Fatalf("expected error %q, got %q", tc.expectedErr, err)
-			}
-			continue
-		}
-		if row == nil || len(cols) != 1 {
-			numRows := 0
-			if row != nil {
-				numRows = 1
-			}
-			t.Fatalf("unexpected result shape %d, %d", numRows, len(cols))
-		}
-		hasRoleOption := bool(*row[0].(*tree.DBool))
-		if hasRoleOption != tc.expected {
-			t.Fatalf(
-				"expected %q has_role_option('%s') %v, got %v", tc.user, tc.option, tc.expected,
-				hasRoleOption)
-		}
-	}
 }
 
 func TestSessionBoundInternalExecutor(t *testing.T) {
@@ -728,8 +619,9 @@ func TestInternalExecutorEncountersRetry(t *testing.T) {
 
 	ctx := context.Background()
 	params, _ := createTestServerParams()
-	s, db, kvDB := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop(ctx)
+	srv, db, kvDB := serverutils.StartServer(t, params)
+	defer srv.Stopper().Stop(ctx)
+	s := srv.ApplicationLayer()
 
 	if _, err := db.Exec("CREATE DATABASE test; CREATE TABLE test.t (c) AS SELECT 1"); err != nil {
 		t.Fatal(err)
@@ -792,6 +684,25 @@ func TestInternalExecutorEncountersRetry(t *testing.T) {
 		_, err := ie.ExecEx(ctx, "read rows", txn, ieo, rowsStmt)
 		if !testutils.IsError(err, "inject_retry_errors_enabled") {
 			t.Fatalf("expected to see injected retry error, got %v", err)
+		}
+	})
+
+	// This test case verifies that ExecEx stops retrying once the limit on the
+	// number of retries is reached.
+	t.Run("ExecEx retry limit reached in implicit txn", func(t *testing.T) {
+		// This number must be less than the number of errors injected (which is
+		// determined by sql.numTxnRetryErrors = 3).
+		if _, err := db.Exec("SET CLUSTER SETTING sql.internal_executor.rows_affected_retry_limit = 1;"); err != nil {
+			t.Fatal(err)
+		}
+		defer func() {
+			if _, err := db.Exec("RESET CLUSTER SETTING sql.internal_executor.rows_affected_retry_limit;"); err != nil {
+				t.Fatal(err)
+			}
+		}()
+		_, err := ie.ExecEx(ctx, "read rows", nil /* txn */, ieo, rowsStmt)
+		if err == nil {
+			t.Fatal("expected to get an injected retriable error")
 		}
 	})
 

@@ -100,16 +100,10 @@ DROP TABLE splitmerge.t;
 
 func runVersionUpgrade(ctx context.Context, t test.Test, c cluster.Cluster) {
 	c.Put(ctx, t.DeprecatedWorkload(), "./workload", c.All())
-	testOptions := []mixedversion.CustomOption{mixedversion.AlwaysUseFixtures}
-	if c.IsLocal() {
-		// Always use latest predecessors when running locally. This is
-		// primarily to avoid disruptive flakes in CI due to known bugs in
-		// older releases (e.g., #110702). We might eventually apply this
-		// option unconditionally if the test also starts flaking too much
-		// on the nightly build.
-		testOptions = append(testOptions, mixedversion.AlwaysUseLatestPredecessors)
-	}
-	mvt := mixedversion.NewTest(ctx, t, t.L(), c, c.All(), testOptions...)
+	mvt := mixedversion.NewTest(
+		ctx, t, t.L(), c, c.All(),
+		mixedversion.AlwaysUseFixtures, mixedversion.AlwaysUseLatestPredecessors,
+	)
 	mvt.OnStartup(
 		"setup schema changer workload",
 		func(ctx context.Context, l *logger.Logger, rng *rand.Rand, h *mixedversion.Helper) error {
@@ -144,7 +138,6 @@ func runVersionUpgrade(ctx context.Context, t test.Test, c cluster.Cluster) {
 	mvt.InMixedVersion(
 		"test schema change step",
 		func(ctx context.Context, l *logger.Logger, rng *rand.Rand, h *mixedversion.Helper) error {
-			tc := h.Context()
 			// We currently only stage the `workload` binary built off the
 			// SHA being tested; therefore, we skip testing the schemachange
 			// workload if this is not an upgrade or downgrade involving the
@@ -152,7 +145,7 @@ func runVersionUpgrade(ctx context.Context, t test.Test, c cluster.Cluster) {
 			// TODO(renato): stage different workload binaries for the
 			// releases being used in the test and use the appropriate
 			// binary in this step.
-			if !tc.FromVersion.IsCurrent() && !tc.ToVersion.IsCurrent() {
+			if !h.Context.ToVersion.IsCurrent() {
 				l.Printf("skipping this step -- only supported when current version is involved")
 				return nil
 			}

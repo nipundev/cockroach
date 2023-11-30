@@ -39,6 +39,7 @@ client_encoding                                            UTF8
 client_min_messages                                        notice
 copy_from_atomic_enabled                                   on
 copy_from_retries_enabled                                  on
+copy_transaction_quality_of_service                        background
 cost_scans_with_default_col_size                           off
 database                                                   test
 datestyle                                                  ISO, MDY
@@ -60,6 +61,7 @@ disable_partially_distributed_plans                        off
 disable_plan_gists                                         off
 disallow_full_table_scans                                  off
 distsql                                                    off
+distsql_plan_gateway_bias                                  2
 enable_auto_rehoming                                       off
 enable_create_stats_using_extremes                         off
 enable_durable_locking_for_serializable                    off

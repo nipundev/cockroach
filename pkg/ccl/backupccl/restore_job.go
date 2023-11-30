@@ -59,13 +59,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/catconstants"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/catid"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/stats"
-	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
-	"github.com/cockroachdb/cockroach/pkg/util/admission/admissionpb"
 	bulkutil "github.com/cockroachdb/cockroach/pkg/util/bulk"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
-	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/interval"
@@ -294,7 +290,7 @@ func restore(
 		return emptyRowCount, err
 	}
 
-	on231 := clusterversion.ByKey(clusterversion.V23_1).LessEq(job.Payload().CreationClusterVersion)
+	on231 := clusterversion.V23_1.Version().LessEq(job.Payload().CreationClusterVersion)
 	progressTracker, err := makeProgressTracker(
 		dataToRestore.getSpans(),
 		job.Progress().Details.(*jobspb.Progress_Restore).Restore.Checkpoint,
@@ -305,6 +301,11 @@ func restore(
 		return emptyRowCount, err
 	}
 
+	targetSize := targetRestoreSpanSize.Get(&execCtx.ExecCfg().Settings.SV)
+	if details.ExperimentalOnline {
+		targetSize = targetOnlineRestoreSpanSize.Get(&execCtx.ExecCfg().Settings.SV)
+	}
+
 	var filter spanCoveringFilter
 	if filter, err = func() (spanCoveringFilter, error) {
 		progressTracker.mu.Lock()
@@ -313,7 +314,7 @@ func restore(
 			progressTracker.mu.checkpointFrontier,
 			job.Progress().Details.(*jobspb.Progress_Restore).Restore.HighWater,
 			introducedSpanFrontier,
-			targetRestoreSpanSize.Get(&execCtx.ExecCfg().Settings.SV),
+			targetSize,
 			progressTracker.useFrontier)
 	}(); err != nil {
 		return roachpb.RowCount{}, err
@@ -329,7 +330,7 @@ func restore(
 	countSpansCh := make(chan execinfrapb.RestoreSpanEntry, 1000)
 	genSpan := func(ctx context.Context, spanCh chan execinfrapb.RestoreSpanEntry) error {
 		defer close(spanCh)
-		return generateAndSendImportSpans(
+		return errors.Wrap(generateAndSendImportSpans(
 			ctx,
 			dataToRestore.getSpans(),
 			backupManifests,
@@ -337,7 +338,7 @@ func restore(
 			backupLocalityMap,
 			filter,
 			spanCh,
-		)
+		), "generate and send import spans")
 	}
 
 	// Count number of import spans.
@@ -357,6 +358,11 @@ func restore(
 		return emptyRowCount, errors.Wrapf(err, "counting number of import spans")
 	}
 
+	// requestFinishedCh is pinged every time restore completes the ingestion of a
+	// restoreSpanEntry. Each ping updates the 'fraction completed' job progress.
+	// Note that online restore pings this channel directly, every time a remote
+	// addsstable completes, while conventional restore pings the channel after
+	// updating the progress frontier.
 	requestFinishedCh := make(chan struct{}, numImportSpans) // enough buffer to never block
 
 	// tasks are the concurrent tasks that are run during the restore.
@@ -368,9 +374,9 @@ func restore(
 		progressLogger := jobs.NewChunkProgressLogger(job, numImportSpans, job.FractionCompleted(), progressTracker.updateJobCallback)
 
 		jobProgressLoop := func(ctx context.Context) error {
-			ctx, progressSpan := tracing.ChildSpan(ctx, "progress-log")
+			ctx, progressSpan := tracing.ChildSpan(ctx, "progress-loop")
 			defer progressSpan.Finish()
-			return progressLogger.Loop(ctx, requestFinishedCh)
+			return errors.Wrap(progressLogger.Loop(ctx, requestFinishedCh), "job progress loop")
 		}
 		tasks = append(tasks, jobProgressLoop)
 	}
@@ -381,21 +387,26 @@ func restore(
 			return genSpan(ctx, progressTracker.inFlightSpanFeeder)
 		})
 	}
+
 	progCh := make(chan *execinfrapb.RemoteProducerMetadata_BulkProcessorProgress)
-	generativeCheckpointLoop := func(ctx context.Context) error {
-		defer close(requestFinishedCh)
-		for progress := range progCh {
-			if spanDone, err := progressTracker.ingestUpdate(ctx, progress); err != nil {
-				return err
-			} else if spanDone {
-				// Signal that the processor has finished importing a span, to update job
-				// progress.
-				requestFinishedCh <- struct{}{}
+	if !details.ExperimentalOnline {
+		// Online restore tracks progress by pinging requestFinishCh instead
+		generativeCheckpointLoop := func(ctx context.Context) error {
+			defer close(requestFinishedCh)
+			for progress := range progCh {
+				if spanDone, err := progressTracker.ingestUpdate(ctx, progress); err != nil {
+					return err
+				} else if spanDone {
+					// Signal that the processor has finished importing a span, to update job
+					// progress.
+					requestFinishedCh <- struct{}{}
+				}
 			}
+			return nil
 		}
-		return nil
+
+		tasks = append(tasks, generativeCheckpointLoop)
 	}
-	tasks = append(tasks, generativeCheckpointLoop)
 
 	// tracingAggLoop is responsible for draining the channel on which processors
 	// in the DistSQL flow will send back their tracing aggregator stats. These
@@ -422,7 +433,7 @@ func restore(
 	runRestore := func(ctx context.Context) error {
 		if details.ExperimentalOnline {
 			log.Warningf(ctx, "EXPERIMENTAL ONLINE RESTORE being used")
-			return sendAddRemoteSSTs(
+			return errors.Wrap(sendAddRemoteSSTs(
 				ctx,
 				execCtx,
 				job,
@@ -430,9 +441,10 @@ func restore(
 				encryption,
 				details.URIs,
 				backupLocalityInfo,
-				progCh,
+				requestFinishedCh,
+				tracingAggCh,
 				genSpan,
-			)
+			), "sending remote AddSSTable requests")
 		}
 		md := restoreJobMetadata{
 			jobID:              job.ID(),
@@ -446,20 +458,17 @@ func restore(
 			numImportSpans:     numImportSpans,
 			execLocality:       details.ExecutionLocality,
 		}
-		return distRestore(
+		return errors.Wrap(distRestore(
 			ctx,
 			execCtx,
 			md,
 			progCh,
 			tracingAggCh,
-		)
+		), "running distributed restore")
 	}
 	tasks = append(tasks, runRestore)
 
 	if err := ctxgroup.GoAndWait(restoreCtx, tasks...); err != nil {
-		// This leaves the data that did get imported in case the user wants to
-		// retry.
-		// TODO(dan): Build tooling to allow a user to restart a failed restore.
 		return emptyRowCount, errors.Wrapf(err, "importing %d ranges", numImportSpans)
 	}
 	// progress go routines should be shutdown, but use lock just to be safe.
@@ -1598,6 +1607,9 @@ func (r *restoreResumer) doResume(ctx context.Context, execCtx interface{}) erro
 	}
 
 	if len(details.DownloadSpans) > 0 {
+		if err := p.ExecCfg().JobRegistry.CheckPausepoint("restore.before_do_download_files"); err != nil {
+			return err
+		}
 		return r.doDownloadFiles(ctx, p)
 	}
 
@@ -1682,7 +1694,7 @@ func (r *restoreResumer) doResume(ctx context.Context, execCtx interface{}) erro
 		// the first place, as a special case.
 		publishDescriptors := func(ctx context.Context, txn descs.Txn) error {
 			return r.publishDescriptors(
-				ctx, p.ExecCfg().JobRegistry, p.ExecCfg().JobsKnobs(), txn, p.User(), details, nil, p.ExecCfg().NodeInfo.LogicalClusterID(),
+				ctx, p.ExecCfg().JobRegistry, p.ExecCfg().JobsKnobs(), txn, p.User(), details, p.ExecCfg().NodeInfo.LogicalClusterID(),
 			)
 		}
 		if err := r.execCfg.InternalDB.DescsTxn(ctx, publishDescriptors); err != nil {
@@ -1807,24 +1819,10 @@ func (r *restoreResumer) doResume(ctx context.Context, execCtx interface{}) erro
 		return errors.Wrap(err, "inserting table statistics")
 	}
 
-	var devalidateIndexes map[descpb.ID][]descpb.IndexID
-	if toValidate := len(details.RevalidateIndexes); toValidate > 0 {
-		if err := r.job.NoTxn().RunningStatus(ctx, func(_ context.Context, _ jobspb.Details) (jobs.RunningStatus, error) {
-			return jobs.RunningStatus(fmt.Sprintf("re-validating %d indexes", toValidate)), nil
-		}); err != nil {
-			return errors.Wrapf(err, "failed to update running status of job %d", errors.Safe(r.job.ID()))
-		}
-		bad, err := revalidateIndexes(ctx, p.ExecCfg(), r.job, details.TableDescs, details.RevalidateIndexes)
-		if err != nil {
-			return err
-		}
-		devalidateIndexes = bad
-	}
-
 	publishDescriptors := func(ctx context.Context, txn descs.Txn) (err error) {
 		return r.publishDescriptors(
 			ctx, p.ExecCfg().JobRegistry, p.ExecCfg().JobsKnobs(), txn, p.User(),
-			details, devalidateIndexes, p.ExecCfg().NodeInfo.LogicalClusterID(),
+			details, p.ExecCfg().NodeInfo.LogicalClusterID(),
 		)
 	}
 	if err := r.execCfg.InternalDB.DescsTxn(ctx, publishDescriptors); err != nil {
@@ -1953,92 +1951,6 @@ func (r *restoreResumer) validateJobIsResumable(execConfig *sql.ExecutorConfig) 
 // TODO(msbutler): delete in 23.1
 func isSystemUserRestore(details jobspb.RestoreDetails) bool {
 	return details.DescriptorCoverage == tree.SystemUsers || details.RestoreSystemUsers
-}
-
-func revalidateIndexes(
-	ctx context.Context,
-	execCfg *sql.ExecutorConfig,
-	job *jobs.Job,
-	tables []*descpb.TableDescriptor,
-	indexIDs []jobspb.RestoreDetails_RevalidateIndex,
-) (map[descpb.ID][]descpb.IndexID, error) {
-	indexIDsByTable := make(map[descpb.ID]map[descpb.IndexID]struct{})
-	for _, idx := range indexIDs {
-		if indexIDsByTable[idx.TableID] == nil {
-			indexIDsByTable[idx.TableID] = make(map[descpb.IndexID]struct{})
-		}
-		indexIDsByTable[idx.TableID][idx.IndexID] = struct{}{}
-	}
-
-	// We don't actually need the 'historical' read the way the schema change does
-	// since our table is offline.
-	runner := descs.NewHistoricalInternalExecTxnRunner(hlc.Timestamp{}, func(ctx context.Context, fn descs.InternalExecFn) error {
-		return execCfg.InternalDB.DescsTxn(ctx, func(ctx context.Context, txn descs.Txn) error {
-			return fn(ctx, txn)
-		}, isql.WithPriority(admissionpb.BulkNormalPri))
-	})
-
-	invalidIndexes := make(map[descpb.ID][]descpb.IndexID)
-
-	for _, tbl := range tables {
-		indexes := indexIDsByTable[tbl.ID]
-		if len(indexes) == 0 {
-			continue
-		}
-		tableDesc := tabledesc.NewBuilder(tbl).BuildExistingMutableTable()
-
-		var forward, inverted []catalog.Index
-		for _, idx := range tableDesc.AllIndexes() {
-			if _, ok := indexes[idx.GetID()]; ok {
-				switch idx.GetType() {
-				case descpb.IndexDescriptor_FORWARD:
-					forward = append(forward, idx)
-				case descpb.IndexDescriptor_INVERTED:
-					inverted = append(inverted, idx)
-				}
-			}
-		}
-		if len(forward) > 0 {
-			if err := sql.ValidateForwardIndexes(
-				ctx,
-				job,
-				tableDesc.MakePublic(),
-				forward,
-				runner,
-				false, /* withFirstMutationPublic */
-				true,  /* gatherAllInvalid */
-				sessiondata.NoSessionDataOverride,
-				execCfg.ProtectedTimestampManager,
-			); err != nil {
-				if invalid := (sql.InvalidIndexesError{}); errors.As(err, &invalid) {
-					invalidIndexes[tableDesc.ID] = invalid.Indexes
-				} else {
-					return nil, err
-				}
-			}
-		}
-		if len(inverted) > 0 {
-			if err := sql.ValidateInvertedIndexes(
-				ctx,
-				execCfg.Codec,
-				job,
-				tableDesc.MakePublic(),
-				inverted,
-				runner,
-				false, /* withFirstMutationPublic */
-				true,  /* gatherAllInvalid */
-				sessiondata.NoSessionDataOverride,
-				execCfg.ProtectedTimestampManager,
-			); err != nil {
-				if invalid := (sql.InvalidIndexesError{}); errors.As(err, &invalid) {
-					invalidIndexes[tableDesc.ID] = append(invalidIndexes[tableDesc.ID], invalid.Indexes...)
-				} else {
-					return nil, err
-				}
-			}
-		}
-	}
-	return invalidIndexes, nil
 }
 
 // ReportResults implements JobResultsReporter interface.
@@ -2206,7 +2118,6 @@ func (r *restoreResumer) publishDescriptors(
 	txn descs.Txn,
 	user username.SQLUsername,
 	details jobspb.RestoreDetails,
-	devalidateIndexes map[descpb.ID][]descpb.IndexID,
 	clusterID uuid.UUID,
 ) (err error) {
 	if details.DescriptorsPublished {
@@ -2259,21 +2170,6 @@ func (r *restoreResumer) publishDescriptors(
 		if mutTable.GetDeclarativeSchemaChangerState() != nil {
 			newTables = append(newTables, mutTable.TableDesc())
 			continue
-		}
-
-		badIndexes := devalidateIndexes[mutTable.ID]
-		for _, badIdx := range badIndexes {
-			found, err := catalog.MustFindIndexByID(mutTable, badIdx)
-			if err != nil {
-				return err
-			}
-			newIdx := found.IndexDescDeepCopy()
-			mutTable.RemovePublicNonPrimaryIndex(found.Ordinal())
-			if err := mutTable.AddIndexMutationMaybeWithTempIndex(
-				&newIdx, descpb.DescriptorMutation_ADD,
-			); err != nil {
-				return err
-			}
 		}
 
 		version := r.settings.Version.ActiveVersion(ctx)
@@ -2544,7 +2440,7 @@ func (r *restoreResumer) CollectProfile(ctx context.Context, execCtx interface{}
 		aggStatsCopy = r.mu.perNodeAggregatorStats.DeepCopy()
 	}()
 	return bulkutil.FlushTracingAggregatorStats(ctx, r.job.ID(),
-		p.ExecCfg().InternalDB, aggStatsCopy, p.ExecCfg().Settings.Version)
+		p.ExecCfg().InternalDB, aggStatsCopy)
 }
 
 // dropDescriptors implements the OnFailOrCancel logic.
@@ -3029,13 +2925,9 @@ func (r *restoreResumer) restoreSystemUsers(
 				return err
 			}
 
-			roleMembersHasIDColumns := r.execCfg.Settings.Version.IsActive(ctx, clusterversion.TODO_Delete_V23_1RoleMembersTableHasIDColumns)
 			insertRoleMember := `
 INSERT INTO system.role_members ("role", "member", "isAdmin", role_id, member_id)
 VALUES ($1, $2, $3, (SELECT user_id FROM system.users WHERE username = $1), (SELECT user_id FROM system.users WHERE username = $2))`
-			if !roleMembersHasIDColumns {
-				insertRoleMember = `INSERT INTO system.role_members ("role", "member", "isAdmin") VALUES ($1, $2, $3)`
-			}
 
 			for _, roleMember := range roleMembers {
 				member := tree.MustBeDString(roleMember[1])
@@ -3209,167 +3101,6 @@ func (r *restoreResumer) cleanupTempSystemTables(ctx context.Context) error {
 	return nil
 }
 
-var onlineRestoreGate = envutil.EnvOrDefaultBool("COCKROACH_UNSAFE_RESTORE", false)
-
-// sendAddRemoteSSTs is a stubbed out, very simplisitic version of restore used
-// to test out ingesting "remote" SSTs. It will be replaced with a real distsql
-// plan and processors in the future.
-func sendAddRemoteSSTs(
-	ctx context.Context,
-	execCtx sql.JobExecContext,
-	job *jobs.Job,
-	dataToRestore restorationData,
-	encryption *jobspb.BackupEncryptionOptions,
-	uris []string,
-	backupLocalityInfo []jobspb.RestoreDetails_BackupLocalityInfo,
-	progCh chan *execinfrapb.RemoteProducerMetadata_BulkProcessorProgress,
-	genSpan func(ctx context.Context, spanCh chan execinfrapb.RestoreSpanEntry) error,
-) error {
-	defer close(progCh)
-
-	if !onlineRestoreGate {
-		return errors.AssertionFailedf("experimental restore mode not supported")
-	}
-
-	if encryption != nil {
-		return errors.AssertionFailedf("encryption not supported with online restore")
-	}
-	if len(uris) > 1 {
-		return errors.AssertionFailedf("online restore can only restore data from a full backup")
-	}
-
-	restoreSpanEntriesCh := make(chan execinfrapb.RestoreSpanEntry, 1)
-
-	g := ctxgroup.WithContext(ctx)
-	g.GoCtx(func(ctx context.Context) error {
-		return genSpan(ctx, restoreSpanEntriesCh)
-	})
-	remainingBytesInTargetRange := int64(512 << 20)
-
-	// We lost the string URIs for the backup storage locations very early in the
-	// process of planning the restore, when the backups were resolved, and the
-	// parsed proto versions -- which we usually prefer -- were attached to the
-	// backup manifests and the individual files during span generation. However
-	// for telling pebble the locations of the files we need those raw string URIs
-	// again. We could plumb them side-by-side with the proto versions, but for
-	// now we'll just reverse engineer them: we'll make a map that has the proto
-	// version of every URI we might have parsed -- all the default backup URIs
-	// and any locality bucket URIs -- to the raw URI that produces that proto.
-	// We can then look in this map using the proto attached to each file to find
-	// the URI for that file.
-	// TODO(dt/butler): should we plumb the original string instead?
-	urisForDirs := make(map[string]string)
-	for _, u := range uris {
-		dir, err := cloud.ExternalStorageConfFromURI(u, username.SQLUsername{})
-		if err != nil {
-			return err
-		}
-		urisForDirs[dir.String()] = u
-	}
-	for _, loc := range backupLocalityInfo {
-		for _, u := range loc.URIsByOriginalLocalityKV {
-			dir, err := cloud.ExternalStorageConfFromURI(u, username.SQLUsername{})
-			if err != nil {
-				return err
-			}
-			urisForDirs[dir.String()] = u
-		}
-	}
-
-	openedStorages := make(map[cloudpb.ExternalStorage]cloud.ExternalStorage)
-	defer func() {
-		for _, es := range openedStorages {
-			es.Close()
-		}
-	}()
-
-	for entry := range restoreSpanEntriesCh {
-		for _, file := range entry.Files {
-
-			log.Infof(ctx, "Experimental restore: sending span %s of file %s",
-				file.BackupFileEntrySpan, file.Path)
-
-			restoringSubspan := file.BackupFileEntrySpan.Intersect(entry.Span)
-
-			// NB: Since the restored span is a subset of the BackupFileEntrySpan,
-			// these counts may be an overestimate of what actually gets restored.
-			counts := file.BackupFileEntryCounts
-
-			if counts.DataSize > remainingBytesInTargetRange {
-				log.Infof(ctx, "Experimental restore: need to split since %d > %d",
-					counts.DataSize, remainingBytesInTargetRange,
-				)
-				expiration := execCtx.ExecCfg().Clock.Now().AddDuration(time.Hour)
-				if err := execCtx.ExecCfg().DB.AdminSplit(ctx, restoringSubspan.Key, expiration); err != nil {
-					log.Warningf(ctx, "failed to split during experimental restore: %v", err)
-				}
-				if _, err := execCtx.ExecCfg().DB.AdminScatter(ctx, restoringSubspan.Key, 4<<20); err != nil {
-					log.Warningf(ctx, "failed to scatter during experimental restore: %v", err)
-				}
-			}
-
-			if file.BackingFileSize == 0 {
-				if _, ok := openedStorages[file.Dir]; !ok {
-					es, err := execCtx.ExecCfg().DistSQLSrv.ExternalStorage(ctx, file.Dir)
-					if err != nil {
-						return err
-					}
-					openedStorages[file.Dir] = es
-				}
-
-				sz, err := openedStorages[file.Dir].Size(ctx, file.Path)
-				if err != nil {
-					return err
-				}
-				file.BackingFileSize = uint64(sz)
-			}
-			uri, ok := urisForDirs[file.Dir.String()]
-			if !ok {
-				return errors.AssertionFailedf("URI not found for %s", file.Dir.String())
-			}
-
-			loc := kvpb.AddSSTableRequest_RemoteFile{
-				Locator:         uri,
-				Path:            file.Path,
-				BackingFileSize: file.BackingFileSize,
-			}
-			// TODO(dt): see if KV has any better ideas for making these up.
-			fileStats := &enginepb.MVCCStats{
-				ContainsEstimates: 1,
-				KeyBytes:          counts.DataSize / 2,
-				ValBytes:          counts.DataSize / 2,
-				LiveBytes:         counts.DataSize,
-				KeyCount:          counts.Rows + counts.IndexEntries,
-				LiveCount:         counts.Rows + counts.IndexEntries,
-			}
-			var err error
-			_, remainingBytesInTargetRange, err = execCtx.ExecCfg().DB.AddRemoteSSTable(ctx,
-				restoringSubspan, loc,
-				fileStats)
-			if err != nil {
-				return err
-			}
-		}
-	}
-
-	downloadSpans := dataToRestore.getSpans()
-
-	log.Infof(ctx, "creating job to track downloads in %d spans", len(downloadSpans))
-	downloadJobRecord := jobs.Record{
-		Description: fmt.Sprintf("Background Data Download for %s", job.Payload().Description),
-		Username:    job.Payload().UsernameProto.Decode(),
-		Details:     jobspb.RestoreDetails{DownloadSpans: downloadSpans},
-		Progress:    jobspb.RestoreProgress{},
-	}
-
-	return execCtx.ExecCfg().InternalDB.DescsTxn(ctx, func(
-		ctx context.Context, txn descs.Txn,
-	) error {
-		_, err := execCtx.ExecCfg().JobRegistry.CreateJobWithTxn(ctx, downloadJobRecord, job.ID()+1, txn)
-		return err
-	})
-}
-
 var _ jobs.Resumer = &restoreResumer{}
 
 func init() {
@@ -3385,90 +3116,6 @@ func init() {
 		},
 		jobs.UsesTenantCostControl,
 	)
-}
-
-func (r *restoreResumer) doDownloadFiles(ctx context.Context, execCtx sql.JobExecContext) error {
-	details := r.job.Details().(jobspb.RestoreDetails)
-	total := r.job.Progress().Details.(*jobspb.Progress_Restore).Restore.TotalDownloadRequired
-
-	// If this is the first resumption of this job, we need to find out the total
-	// amount we expect to download and persist it so that we can indiciate our
-	// progress as that number goes down later.
-	if total == 0 {
-		log.Infof(ctx, "calculating total download size (across all stores) to complete restore")
-		if err := r.job.NoTxn().RunningStatus(ctx, func(_ context.Context, _ jobspb.Details) (jobs.RunningStatus, error) {
-			return jobs.RunningStatus("Calculating total download size..."), nil
-		}); err != nil {
-			return errors.Wrapf(err, "failed to update running status of job %d", errors.Safe(r.job.ID()))
-		}
-
-		for _, span := range details.DownloadSpans {
-			resp, err := execCtx.ExecCfg().TenantStatusServer.SpanStats(ctx, &roachpb.SpanStatsRequest{
-				Spans: []roachpb.Span{span},
-			})
-			if err != nil {
-				return err
-			}
-			for _, stats := range resp.SpanToStats {
-				total += stats.ExternalFileBytes
-			}
-		}
-
-		if total == 0 {
-			return nil
-		}
-
-		if err := r.job.NoTxn().FractionProgressed(ctx, func(ctx context.Context, details jobspb.ProgressDetails) float32 {
-			prog := details.(*jobspb.Progress_Restore).Restore
-			prog.TotalDownloadRequired = total
-			return 0.0
-		}); err != nil {
-			return err
-		}
-
-		if err := r.job.NoTxn().RunningStatus(ctx, func(_ context.Context, _ jobspb.Details) (jobs.RunningStatus, error) {
-			return jobs.RunningStatus(fmt.Sprintf("Downloading %s of restored data...", sz(total))), nil
-		}); err != nil {
-			return errors.Wrapf(err, "failed to update running status of job %d", errors.Safe(r.job.ID()))
-		}
-	}
-
-	var lastProgressUpdate time.Time
-	for rt := retry.StartWithCtx(
-		ctx, retry.Options{InitialBackoff: time.Second * 10, Multiplier: 1.2, MaxBackoff: time.Minute * 5},
-	); ; rt.Next() {
-
-		var remaining uint64
-		for _, span := range details.DownloadSpans {
-			resp, err := execCtx.ExecCfg().TenantStatusServer.SpanStats(ctx, &roachpb.SpanStatsRequest{
-				Spans: []roachpb.Span{span},
-			})
-			if err != nil {
-				return err
-			}
-			for _, stats := range resp.SpanToStats {
-				remaining += stats.ExternalFileBytes
-			}
-		}
-
-		fractionComplete := float32(total-remaining) / float32(total)
-		log.Infof(ctx, "restore download phase, %s downloaded, %s remaining of %s total (%.1f complete)",
-			sz(total-remaining), sz(remaining), sz(total), fractionComplete,
-		)
-
-		if remaining == 0 {
-			return nil
-		}
-
-		if timeutil.Since(lastProgressUpdate) > time.Minute {
-			if err := r.job.NoTxn().FractionProgressed(ctx, func(ctx context.Context, details jobspb.ProgressDetails) float32 {
-				return fractionComplete
-			}); err != nil {
-				return err
-			}
-			lastProgressUpdate = timeutil.Now()
-		}
-	}
 }
 
 type sz int64

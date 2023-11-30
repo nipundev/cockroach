@@ -3400,6 +3400,10 @@ func (m *sessionDataMutator) SetQualityOfService(val sessiondatapb.QoSLevel) {
 	m.data.DefaultTxnQualityOfService = val.Validate()
 }
 
+func (m *sessionDataMutator) SetCopyQualityOfService(val sessiondatapb.QoSLevel) {
+	m.data.CopyTxnQualityOfService = val.Validate()
+}
+
 func (m *sessionDataMutator) SetOptSplitScanLimit(val int32) {
 	m.data.OptSplitScanLimit = val
 }
@@ -3699,6 +3703,10 @@ func (m *sessionDataMutator) SetOptimizerUseProvidedOrderingFix(val bool) {
 
 func (m *sessionDataMutator) SetDisableChangefeedReplication(val bool) {
 	m.data.DisableChangefeedReplication = val
+}
+
+func (m *sessionDataMutator) SetDistSQLPlanGatewayBias(val int64) {
+	m.data.DistsqlPlanGatewayBias = val
 }
 
 // Utility functions related to scrubbing sensitive information on SQL Stats.

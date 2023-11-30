@@ -66,6 +66,7 @@ crdb_internal  kv_node_liveness                        table  node  NULL  NULL
 crdb_internal  kv_node_status                          table  node  NULL  NULL
 crdb_internal  kv_protected_ts_records                 table  node  NULL  NULL
 crdb_internal  kv_repairable_catalog_corruptions       view   node  NULL  NULL
+crdb_internal  kv_session_based_leases                 table  node  NULL  NULL
 crdb_internal  kv_store_status                         table  node  NULL  NULL
 crdb_internal  kv_system_privileges                    view   node  NULL  NULL
 crdb_internal  leases                                  table  node  NULL  NULL
@@ -1009,22 +1010,6 @@ user testuser
 query error crdb_internal.compact_engine_span\(\): insufficient privilege
 SELECT crdb_internal.compact_engine_span(1, 1, decode('c08989', 'hex'), decode('c0898a', 'hex'))
 
-subtest builtin_is_admin
-
-user root
-
-query B
-SELECT crdb_internal.is_admin()
-----
-true
-
-user testuser
-
-query B
-SELECT crdb_internal.is_admin()
-----
-false
-
 user root
 
 # Test the crdb_internal.create_type_statements table.
@@ -1327,11 +1312,10 @@ NULL 100 KiB
 
 # Sanity checks of the crdb_internal.node_memory_monitors table.
 
-# The root monitor has a standalone budget, so its 'used' field is zero.
-query BB
-SELECT used = 0, reserved_used > 0 FROM crdb_internal.node_memory_monitors WHERE name = 'root'
+query BBB
+SELECT used > 0, reserved_used > 0, used < reserved_used FROM crdb_internal.node_memory_monitors WHERE name = 'root'
 ----
-true true
+true true true
 
 query B
 SELECT used > 0 FROM crdb_internal.node_memory_monitors WHERE name = 'sql'

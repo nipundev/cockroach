@@ -25,7 +25,6 @@ import (
 	"path/filepath"
 	"reflect"
 	"regexp"
-	"runtime/pprof"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -109,7 +108,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/errors/oserror"
-	"github.com/cockroachdb/logtags"
 	"github.com/cockroachdb/redact"
 	pgx "github.com/jackc/pgx/v4"
 	"github.com/kr/pretty"
@@ -227,75 +225,6 @@ func TestBackupRestoreMultiNodeRemote(t *testing.T) {
 	backupAndRestore(ctx, t, tc, []string{remoteFoo}, []string{localFoo}, numAccounts, nil)
 }
 
-// TestBackupRestoreJobTagAndLabel runs a backup and restore and verifies that
-// the flows are executed remotely with a job log tag and a job pprof label.
-func TestBackupRestoreJobTagAndLabel(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	defer log.Scope(t).Close(t)
-	skip.UnderRaceWithIssue(t, 107336)
-
-	const numAccounts = 1000
-	ctx := context.Background()
-	getJobTag := func(ctx context.Context) string {
-		tags := logtags.FromContext(ctx)
-		if tags != nil {
-			for _, tag := range tags.Get() {
-				if tag.Key() == "job" {
-					return tag.ValueStr()
-				}
-			}
-		}
-		return ""
-	}
-	found := false
-	var mu syncutil.Mutex
-	// backupRestoreTestSetupWithParams() writes some data and then, within
-	// workloadsql.Setup() it splits and scatters the ranges. When using 3 nodes
-	// scatter means we only move leases which is usually enough. During stress or
-	// race we see that the leases may not be scattered because the other 2
-	// replicas are not yet initialized. In those cases the leases all stay on
-	// node 1 and therefore the flows run locally and the test fails (because
-	// 'found' stays false). The simple solution here is to use 4 nodes where
-	// scatter moves replicas in addition to leases.
-	numNodes := 4
-	tc, _, _, cleanupFn := backupRestoreTestSetupWithParams(t, numNodes, numAccounts, InitManualReplication,
-		base.TestClusterArgs{
-			ServerArgs: base.TestServerArgs{
-				DefaultTestTenant: base.TestDoesNotWorkWithSharedProcessModeButWeDontKnowWhyYet(
-					base.TestTenantProbabilistic, 113857, /* issueNumber */
-				),
-				Knobs: base.TestingKnobs{
-					DistSQL: &execinfra.TestingKnobs{
-						SetupFlowCb: func(ctx context.Context, _ base.SQLInstanceID, _ *execinfrapb.SetupFlowRequest) error {
-							mu.Lock()
-							defer mu.Unlock()
-							tag := getJobTag(ctx)
-							label, ok := pprof.Label(ctx, "job")
-							if tag == "" && !ok {
-								// Skip, it's not a job.
-								return nil
-							}
-							if tag == "" || !ok || tag != label {
-								log.Fatalf(ctx, "the job tag should exist and match the pprof label: tag=%s label=%s ctx=%s",
-									tag, label, ctx)
-							}
-							found = true
-							return nil
-						},
-					},
-				},
-			},
-		},
-	)
-	defer cleanupFn()
-
-	backupAndRestore(ctx, t, tc, []string{localFoo}, []string{localFoo}, numAccounts, nil)
-
-	mu.Lock()
-	defer mu.Unlock()
-	require.True(t, found)
-}
-
 func findSST(t *testing.T, location string) string {
 	sstMatcher := regexp.MustCompile(`\d+\.sst`)
 	subDir := filepath.Join(location, "data")
@@ -330,6 +259,9 @@ func requireHasNoSSTs(t *testing.T, locations ...string) {
 // are wrapped with SucceedsSoon() because EXPERIMENTAL_RELOCATE can fail if
 // there are other replication changes happening.
 func ensureLeaseholder(t *testing.T, sqlDB *sqlutils.SQLRunner) {
+	// Anything that is calling this to ensure *leaseholders* probably cares about
+	// the work going to the leaseholders as it did before follower reads.
+	sqlDB.Exec(t, `SET CLUSTER SETTING bulkio.backup.balanced_distribution.enabled = false`)
 	for _, stmt := range []string{
 		`ALTER TABLE data.bank SPLIT AT VALUES (0)`,
 		`ALTER TABLE data.bank SPLIT AT VALUES (100)`,
@@ -1738,7 +1670,7 @@ func TestBackupRestoreResume(t *testing.T) {
 				},
 			},
 			// Required because restore checkpointing is version gated.
-			clusterversion.ByKey(clusterversion.V23_1),
+			clusterversion.V23_1.Version(),
 		)
 		// If the restore properly took the (incorrect) low-water mark into account,
 		// the first half of the table will be missing.
@@ -3909,21 +3841,23 @@ func TestBackupRestoreChecksum(t *testing.T) {
 		}
 	}
 
-	// Corrupt one of the files in the backup.
-	f, err := os.OpenFile(filepath.Join(dir, backupManifest.Files[0].Path), os.O_WRONLY, 0)
-	if err != nil {
-		t.Fatalf("%+v", err)
-	}
-	defer f.Close()
-	// mess with some bytes.
-	if _, err := f.Seek(-65, io.SeekEnd); err != nil {
-		t.Fatalf("%+v", err)
-	}
-	if _, err := f.Write([]byte{'1', '2', '3'}); err != nil {
-		t.Fatalf("%+v", err)
-	}
-	if err := f.Sync(); err != nil {
-		t.Fatalf("%+v", err)
+	// Corrupt all of the files in the backup.
+	for i := range backupManifest.Files {
+		f, err := os.OpenFile(filepath.Join(dir, backupManifest.Files[i].Path), os.O_WRONLY, 0)
+		if err != nil {
+			t.Fatalf("%+v", err)
+		}
+		defer f.Close()
+		// mess with some bytes.
+		if _, err := f.Seek(-65, io.SeekEnd); err != nil {
+			t.Fatalf("%+v", err)
+		}
+		if _, err := f.Write([]byte{'1', '2', '3'}); err != nil {
+			t.Fatalf("%+v", err)
+		}
+		if err := f.Sync(); err != nil {
+			t.Fatalf("%+v", err)
+		}
 	}
 
 	sqlDB.Exec(t, `DROP TABLE data.bank`)
@@ -7524,7 +7458,7 @@ func TestBackupExportRequestTimeout(t *testing.T) {
 	// should hang. The timeout should save us in this case.
 	_, err := sqlSessions[1].DB.ExecContext(ctx, "BACKUP data.bank TO 'nodelocal://1/timeout'")
 	require.Regexp(t,
-		`exporting .*/Table/\d+/.*\: context deadline exceeded`,
+		`running distributed backup to export.*/Table/\d+/.*\: context deadline exceeded`,
 		err.Error())
 }
 
@@ -11197,7 +11131,7 @@ func TestRestoreMemoryMonitoringWithShadowing(t *testing.T) {
 	sqlDB.Exec(t, "CREATE DATABASE data2")
 	sqlDB.Exec(t, "RESTORE data.bank FROM latest IN 'userfile:///backup' WITH OPTIONS (into_db='data2')")
 	files := sqlDB.QueryStr(t, "SHOW BACKUP FILES FROM latest IN 'userfile:///backup'")
-	require.Equal(t, 11, len(files)) // 1 file for full + 10 for 10 incrementals
+	require.GreaterOrEqual(t, len(files), 11) // 1 file for full + 10 for 10 incrementals
 
 	// Assert that the restore processor is processing the same span multiple
 	// times, and the count is based on what's expected from the memory budget.

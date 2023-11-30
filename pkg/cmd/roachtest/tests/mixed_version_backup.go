@@ -44,6 +44,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/testutils/jobutils"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
@@ -384,6 +385,8 @@ type (
 		// restoreAOST contains the AOST used in restore, if non-empty. It also
 		// determines the system time used to grab fingerprints.
 		restoreAOST string
+
+		nodelocal bool
 	}
 
 	fullBackup struct {
@@ -831,6 +834,10 @@ func (sc *systemTableContents) handleSpecialCases(
 func (sc *systemTableContents) loadShowResults(
 	ctx context.Context, l *logger.Logger, timestamp string,
 ) error {
+	if sc.cluster.IsLocal() {
+		// T query below fails on local roachtest, so skip system table fingerprinting.
+		return nil
+	}
 	systemName := strings.TrimPrefix(sc.table, "system.")
 	showStmt, ok := showSystemQueries[systemName]
 	if !ok {
@@ -958,18 +965,21 @@ func (sc *systemTableContents) ValidateRestore(
 	return nil
 }
 
-func newBackupCollection(name string, btype backupScope, options []backupOption) backupCollection {
+func newBackupCollection(
+	name string, btype backupScope, options []backupOption, nodelocal bool,
+) backupCollection {
 	// Use a different seed for generating the collection's nonce to
 	// allow for multiple concurrent runs of this test using the same
 	// COCKROACH_RANDOM_SEED, making it easier to reproduce failures
 	// that are more likely to occur with certain test plans.
 	nonceRng := rand.New(rand.NewSource(timeutil.Now().UnixNano()))
 	return backupCollection{
-		btype:   btype,
-		name:    name,
-		tables:  btype.TargetTables(),
-		options: options,
-		nonce:   randString(nonceRng, nonceLen),
+		btype:     btype,
+		name:      name,
+		tables:    btype.TargetTables(),
+		options:   options,
+		nonce:     randString(nonceRng, nonceLen),
+		nodelocal: nodelocal,
 	}
 }
 
@@ -978,7 +988,11 @@ func (bc *backupCollection) uri() string {
 	// global namespace represented by the BACKUP_TESTING_BUCKET
 	// bucket. The nonce allows multiple people (or TeamCity builds) to
 	// be running this test without interfering with one another.
-	return fmt.Sprintf("gs://%s/mixed-version/%s_%s?AUTH=implicit", testutils.BackupTestingBucketLongTTL(), bc.name, bc.nonce)
+	externalStorage := "gs://"
+	if bc.nodelocal {
+		externalStorage = "nodelocal://1/"
+	}
+	return fmt.Sprintf("%s%s/mixed-version/%s_%s?AUTH=implicit", externalStorage, testutils.BackupTestingBucketLongTTL(), bc.name, bc.nonce)
 }
 
 func (bc *backupCollection) encryptionOption() *encryptionPassphrase {
@@ -1188,7 +1202,11 @@ func (d *BackupRestoreTestDriver) newBackupScope(rng *rand.Rand) backupScope {
 	possibleTypes := []backupScope{
 		newTableBackup(rng, d.dbs, d.tables),
 		newDatabaseBackup(rng, d.dbs, d.tables),
-		newClusterBackup(rng, d.dbs, d.tables),
+	}
+	if !d.cluster.IsLocal() {
+		// Cluster backups cannot be restored on nodelocal because the cluster is
+		// wiped before cluster restore.
+		possibleTypes = append(possibleTypes, newClusterBackup(rng, d.dbs, d.tables))
 	}
 
 	return possibleTypes[rng.Intn(len(possibleTypes))]
@@ -1537,7 +1555,7 @@ func (mvb *mixedVersionBackup) maybeTakePreviousVersionBackup(
 		return nil
 	}
 
-	previousVersion := h.Context().FromVersion
+	previousVersion := h.Context.FromVersion
 	label := fmt.Sprintf("before upgrade in %s", sanitizeVersionForBackup(previousVersion))
 	allPrevVersionNodes := labeledNodes{Nodes: mvb.roachNodes, Version: previousVersion.String()}
 	executeOnAllNodesSpec := backupSpec{PauseProbability: neverPause, Plan: allPrevVersionNodes, Execute: allPrevVersionNodes}
@@ -1548,6 +1566,9 @@ func (mvb *mixedVersionBackup) maybeTakePreviousVersionBackup(
 // workloads to update the databases we are backing up.
 func (d *BackupRestoreTestDriver) randomWait(l *logger.Logger, rng *rand.Rand) {
 	dur := randWaitDuration(rng)
+	if d.testUtils.mock {
+		dur = time.Millisecond
+	}
 	l.Printf("waiting for %s", dur)
 	time.Sleep(dur)
 }
@@ -1564,14 +1585,13 @@ func (d *BackupRestoreTestDriver) nextRestoreID() int64 {
 // depending on the state of the test we are in. The given label is also used to
 // provide more context. Example: '22.2.4-to-current_final'
 func (mvb *mixedVersionBackup) backupNamePrefix(h *mixedversion.Helper, label string) string {
-	testContext := h.Context()
 	var finalizing string
-	if testContext.Finalizing {
+	if h.Context.Finalizing {
 		finalizing = finalizingLabel
 	}
 
-	fromVersion := sanitizeVersionForBackup(testContext.FromVersion)
-	toVersion := sanitizeVersionForBackup(testContext.ToVersion)
+	fromVersion := sanitizeVersionForBackup(h.Context.FromVersion)
+	toVersion := sanitizeVersionForBackup(h.Context.ToVersion)
 	sanitizedLabel := strings.ReplaceAll(label, " ", "-")
 
 	return fmt.Sprintf(
@@ -1704,6 +1724,7 @@ func (d *BackupRestoreTestDriver) computeTableContents(
 	}
 
 	if err := eg.Wait(); err != nil {
+		log.Errorf(ctx, "Error loading system table content %s", err)
 		return nil, err
 	}
 
@@ -1770,7 +1791,7 @@ func (d *BackupRestoreTestDriver) runBackup(
 		btype := d.newBackupScope(rng)
 		name := d.backupCollectionName(d.nextBackupID(), b.namePrefix, btype)
 		createOptions := newBackupOptions(rng)
-		collection = newBackupCollection(name, btype, createOptions)
+		collection = newBackupCollection(name, btype, createOptions, d.cluster.IsLocal())
 		l.Printf("creating full backup for %s", collection.name)
 	case incrementalBackup:
 		collection = b.collection
@@ -1931,6 +1952,9 @@ func (d *BackupRestoreTestDriver) createBackupCollection(
 
 	// Create incremental backups.
 	numIncrementals := possibleNumIncrementalBackups[rng.Intn(len(possibleNumIncrementalBackups))]
+	if d.testUtils.mock {
+		numIncrementals = 1
+	}
 	l.Printf("creating %d incremental backups", numIncrementals)
 	for i := 0; i < numIncrementals; i++ {
 		d.randomWait(l, rng)
@@ -2079,14 +2103,11 @@ func (mvb *mixedVersionBackup) planAndRunBackups(
 		return nil
 	}
 
-	tc := h.Context() // test context
-	l.Printf("current context: %#v", tc)
-
 	onPrevious := labeledNodes{
-		Nodes: tc.FromVersionNodes, Version: sanitizeVersionForBackup(tc.FromVersion),
+		Nodes: h.Context.NodesInPreviousVersion(), Version: sanitizeVersionForBackup(h.Context.FromVersion),
 	}
 	onNext := labeledNodes{
-		Nodes: tc.ToVersionNodes, Version: sanitizeVersionForBackup(tc.ToVersion),
+		Nodes: h.Context.NodesInNextVersion(), Version: sanitizeVersionForBackup(h.Context.ToVersion),
 	}
 	onRandom := labeledNodes{Nodes: mvb.roachNodes, Version: "random node"}
 	defaultPauseProbability := 0.2
@@ -2124,7 +2145,7 @@ func (mvb *mixedVersionBackup) planAndRunBackups(
 		},
 	}
 
-	if len(tc.FromVersionNodes) > 0 {
+	if h.Context.MixedBinary() {
 		const numCollections = 2
 		rng.Shuffle(len(collectionSpecs), func(i, j int) {
 			collectionSpecs[i], collectionSpecs[j] = collectionSpecs[j], collectionSpecs[i]
@@ -2419,8 +2440,8 @@ func (mvb *mixedVersionBackup) verifyAllBackups(
 		}
 	}
 
-	verify(h.Context().FromVersion)
-	verify(h.Context().ToVersion)
+	verify(h.Context.FromVersion)
+	verify(h.Context.ToVersion)
 
 	// If the context was canceled (most likely due to a test timeout),
 	// return early. In these cases, it's likely that `restoreErrors`
@@ -2508,7 +2529,7 @@ func registerBackupMixedVersion(r registry.Registry) {
 			// for the cluster used in this test without overloading it,
 			// which can make the backups take much longer to finish.
 			const numWarehouses = 100
-			bankInit, bankRun := bankWorkloadCmd(t.L(), testRNG, roachNodes)
+			bankInit, bankRun := bankWorkloadCmd(t.L(), testRNG, roachNodes, false)
 			tpccInit, tpccRun := tpccWorkloadCmd(t.L(), testRNG, numWarehouses, roachNodes)
 
 			mvt.OnStartup("set short job interval", backupTest.setShortJobIntervals)
@@ -2558,10 +2579,15 @@ func tpccWorkloadCmd(
 }
 
 func bankWorkloadCmd(
-	l *logger.Logger, testRNG *rand.Rand, roachNodes option.NodeListOption,
+	l *logger.Logger, testRNG *rand.Rand, roachNodes option.NodeListOption, mock bool,
 ) (init *roachtestutil.Command, run *roachtestutil.Command) {
 	bankPayload := bankPossiblePayloadBytes[testRNG.Intn(len(bankPossiblePayloadBytes))]
 	bankRows := bankPossibleRows[testRNG.Intn(len(bankPossibleRows))]
+
+	if mock {
+		bankPayload = 9
+		bankRows = 10
+	}
 
 	init = roachtestutil.NewCommand("./cockroach workload init bank").
 		Flag("rows", bankRows).
@@ -2580,6 +2606,7 @@ type CommonTestUtils struct {
 	t          test.Test
 	cluster    cluster.Cluster
 	roachNodes option.NodeListOption
+	mock       bool
 
 	connCache struct {
 		mu    syncutil.Mutex
@@ -2588,7 +2615,7 @@ type CommonTestUtils struct {
 }
 
 func newCommonTestUtils(
-	ctx context.Context, t test.Test, c cluster.Cluster, nodes option.NodeListOption,
+	ctx context.Context, t test.Test, c cluster.Cluster, nodes option.NodeListOption, mock bool,
 ) (*CommonTestUtils, error) {
 	cc := make([]*gosql.DB, len(nodes))
 	for _, node := range nodes {
@@ -2608,6 +2635,7 @@ func newCommonTestUtils(
 		t:          t,
 		cluster:    c,
 		roachNodes: nodes,
+		mock:       mock,
 	}
 	u.connCache.cache = cc
 	return u, nil
@@ -2616,7 +2644,7 @@ func newCommonTestUtils(
 func (mvb *mixedVersionBackup) CommonTestUtils(ctx context.Context) (*CommonTestUtils, error) {
 	var err error
 	mvb.utilsOnce.Do(func() {
-		mvb.commonTestUtils, err = newCommonTestUtils(ctx, mvb.t, mvb.cluster, mvb.roachNodes)
+		mvb.commonTestUtils, err = newCommonTestUtils(ctx, mvb.t, mvb.cluster, mvb.roachNodes, false)
 	})
 	return mvb.commonTestUtils, err
 }

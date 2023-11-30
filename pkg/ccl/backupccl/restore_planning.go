@@ -1361,6 +1361,12 @@ func restorePlanHook(
 		}
 	}
 
+	if restoreStmt.Options.ExperimentalOnline && !restoreStmt.Targets.TenantID.IsSet() {
+		// TODO(ssd): Disable this once it is less annoying to
+		// disable it in tests.
+		log.Warningf(ctx, "running non-tenant online RESTORE; this is dangerous and will only work if you know exactly what you are doing")
+	}
+
 	var newTenantID *roachpb.TenantID
 	var newTenantName *roachpb.TenantName
 	if restoreStmt.Options.AsTenant != nil || restoreStmt.Options.ForceTenantID != nil {
@@ -1856,8 +1862,13 @@ func doRestorePlan(
 	err = checkBackupManifestVersionCompatability(ctx, p.ExecCfg().Settings.Version,
 		mainBackupManifests, restoreStmt.Options.UnsafeRestoreIncompatibleVersion)
 	if err != nil {
-
 		return err
+	}
+
+	if restoreStmt.Options.ExperimentalOnline {
+		if err := checkManifestsForOnlineCompat(ctx, mainBackupManifests); err != nil {
+			return err
+		}
 	}
 
 	if restoreStmt.DescriptorCoverage == tree.AllDescriptors {
@@ -1876,57 +1887,9 @@ func doRestorePlan(
 		}
 	}
 
-	backupCodec, err := backupinfo.MakeBackupCodec(mainBackupManifests[0])
-	if err != nil {
-		return err
-	}
-
-	// wasOffline tracks which tables were in an offline or adding state at some
-	// point in the incremental chain, meaning their spans would be seeing
-	// non-transactional bulk-writes. If that backup exported those spans, then it
-	// can't be trusted for that table/index since those bulk-writes can fail to
-	// be caught by backups.
-	wasOffline := make(map[tableAndIndex]hlc.Timestamp)
-
 	layerToIterFactory, err := backupinfo.GetBackupManifestIterFactories(ctx, p.ExecCfg().DistSQLSrv.ExternalStorage, mainBackupManifests, encryption, &kmsEnv)
 	if err != nil {
 		return err
-	}
-
-	for i, m := range mainBackupManifests {
-		spans := roachpb.Spans(m.Spans)
-		descIt := layerToIterFactory[i].NewDescIter(ctx)
-		defer descIt.Close()
-
-		for ; ; descIt.Next() {
-			if ok, err := descIt.Valid(); err != nil {
-				return err
-			} else if !ok {
-				break
-			}
-
-			table, _, _, _, _ := descpb.GetDescriptors(descIt.Value())
-			if table == nil {
-				continue
-			}
-			index := table.GetPrimaryIndex()
-			if len(index.Interleave.Ancestors) > 0 || len(index.InterleavedBy) > 0 {
-				return errors.Errorf("restoring interleaved tables is no longer allowed. table %s was found to be interleaved", table.Name)
-			}
-			if err := catalog.ForEachNonDropIndex(
-				tabledesc.NewBuilder(table).BuildImmutable().(catalog.TableDescriptor),
-				func(index catalog.Index) error {
-					if index.Adding() && spans.ContainsKey(backupCodec.IndexPrefix(uint32(table.ID), uint32(index.GetID()))) {
-						k := tableAndIndex{tableID: table.ID, indexID: index.GetID()}
-						if _, ok := wasOffline[k]; !ok {
-							wasOffline[k] = m.EndTime
-						}
-					}
-					return nil
-				}); err != nil {
-				return err
-			}
-		}
 	}
 
 	sqlDescs, restoreDBs, descsByTablePattern, tenants, err := selectTargets(
@@ -1936,25 +1899,6 @@ func doRestorePlan(
 		return errors.Wrap(err,
 			"failed to resolve targets in the BACKUP location specified by the RESTORE statement, "+
 				"use SHOW BACKUP to find correct targets")
-	}
-
-	if err := checkMissingIntroducedSpans(ctx, sqlDescs, mainBackupManifests, layerToIterFactory, endTime, backupCodec); err != nil {
-		return err
-	}
-
-	var revalidateIndexes []jobspb.RestoreDetails_RevalidateIndex
-	for _, desc := range sqlDescs {
-		tbl, ok := desc.(catalog.TableDescriptor)
-		if !ok {
-			continue
-		}
-		for _, idx := range tbl.ActiveIndexes() {
-			if _, ok := wasOffline[tableAndIndex{tableID: desc.GetID(), indexID: idx.GetID()}]; ok {
-				revalidateIndexes = append(revalidateIndexes, jobspb.RestoreDetails_RevalidateIndex{
-					TableID: desc.GetID(), IndexID: idx.GetID(),
-				})
-			}
-		}
 	}
 
 	err = ensureMultiRegionDatabaseRestoreIsAllowed(p, restoreDBs)
@@ -2122,6 +2066,13 @@ func doRestorePlan(
 	} else {
 		fromDescription = from
 	}
+
+	if restoreStmt.Options.ExperimentalOnline {
+		if err := checkRewritesAreNoops(descriptorRewrites); err != nil {
+			return err
+		}
+	}
+
 	description, err := restoreJobDescription(
 		ctx,
 		p,
@@ -2180,9 +2131,6 @@ func doRestorePlan(
 	if err := rewrite.FunctionDescs(functions, descriptorRewrites, overrideDBName); err != nil {
 		return err
 	}
-	for i := range revalidateIndexes {
-		revalidateIndexes[i].TableID = descriptorRewrites[revalidateIndexes[i].TableID].ID
-	}
 
 	encodedTables := make([]*descpb.TableDescriptor, len(tables))
 	for i, table := range tables {
@@ -2199,7 +2147,6 @@ func doRestorePlan(
 		OverrideDB:         overrideDBName,
 		DescriptorCoverage: restoreStmt.DescriptorCoverage,
 		Encryption:         encryption,
-		RevalidateIndexes:  revalidateIndexes,
 		DatabaseModifiers:  databaseModifiers,
 		DebugPauseOn:       debugPauseOn,
 
@@ -2448,7 +2395,7 @@ func planDatabaseModifiersForRestore(
 		return nil, nil, nil
 	}
 	if err := multiregionccl.CheckClusterSupportsMultiRegion(
-		p.ExecCfg().Settings, p.ExecCfg().NodeInfo.LogicalClusterID(),
+		p.ExecCfg().Settings,
 	); err != nil {
 		return nil, nil, errors.WithHintf(
 			err,

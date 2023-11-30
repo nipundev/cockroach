@@ -346,13 +346,6 @@ var streamerConcurrencyLimit = settings.RegisterIntSetting(
 	settings.PositiveInt,
 )
 
-func max(a, b int64) int64 {
-	if a > b {
-		return a
-	}
-	return b
-}
-
 // NewStreamer creates a new Streamer.
 //
 // txn must be a LeafTxn that is not used by anything other than this Streamer.
@@ -780,21 +773,31 @@ func (s *Streamer) Enqueue(ctx context.Context, reqs []kvpb.RequestUnion) (retEr
 // returned once all enqueued requests have been responded to.
 //
 // Calling GetResults() invalidates the results returned on the previous call.
-func (s *Streamer) GetResults(ctx context.Context) ([]Result, error) {
+func (s *Streamer) GetResults(ctx context.Context) (retResults []Result, retErr error) {
 	log.VEvent(ctx, 2, "GetResults")
-	defer log.VEvent(ctx, 2, "exiting GetResults")
+	defer func() {
+		log.VEventf(ctx, 2, "exiting GetResults (%d results, err=%v)", len(retResults), retErr)
+	}()
 	for {
 		results, allComplete, err := s.results.get(ctx)
 		if len(results) > 0 || allComplete || err != nil {
 			return results, err
 		}
 		log.VEvent(ctx, 2, "waiting in GetResults")
-		s.results.wait()
-		// Check whether the Streamer has been canceled or closed while we were
-		// waiting for the results.
-		if err = ctx.Err(); err != nil {
+		if err = s.results.wait(ctx); err != nil {
 			s.results.setError(err)
 			return nil, err
+		}
+		if buildutil.CrdbTestBuild {
+			// Check whether the Streamer has been canceled or closed while we
+			// were	waiting for the results.
+			//
+			// Note that this check is done within wait() call above in non-test
+			// builds.
+			if err = ctx.Err(); err != nil {
+				s.results.setError(err)
+				return nil, err
+			}
 		}
 	}
 }
@@ -1690,7 +1693,6 @@ func processSingleRangeResults(
 			get := response
 			if get.ResumeSpan != nil {
 				// This Get wasn't completed.
-				log.VEvent(ctx, 2, "incomplete Get")
 				continue
 			}
 			// This Get was completed.
@@ -1723,7 +1725,6 @@ func processSingleRangeResults(
 				// multiple ranges and the last range has no data in it - we
 				// want to be able to set scanComplete field on such an empty
 				// Result).
-				log.VEvent(ctx, 2, "incomplete Scan")
 				continue
 			}
 			result := Result{

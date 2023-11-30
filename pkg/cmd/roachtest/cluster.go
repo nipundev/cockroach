@@ -2079,17 +2079,20 @@ func (c *clusterImpl) StopE(
 	if c.spec.NodeCount == 0 {
 		return nil // unit tests
 	}
-	if c.goCoverDir != "" {
-		// Never kill processes if we're trying to collect coverage; use SIGUSR1
-		// which dumps coverage data and exits.
-		if stopOpts.RoachprodOpts.Sig == 9 {
-			stopOpts.RoachprodOpts.Sig = 10 // SIGUSR1
-			stopOpts.RoachprodOpts.Wait = true
-			stopOpts.RoachprodOpts.MaxWait = 10
-		}
-	}
 	c.setStatusForClusterOpt("stopping", stopOpts.RoachtestOpts.Worker, nodes...)
 	defer c.clearStatusForClusterOpt(stopOpts.RoachtestOpts.Worker)
+
+	if c.goCoverDir != "" && stopOpts.RoachprodOpts.Sig == 9 /* SIGKILL */ {
+		// If we are trying to collect coverage, we don't want to kill processes;
+		// use SIGUSR1 which dumps coverage data and exits. Note that Cockroach
+		// v23.1 and earlier ignore SIGUSR1, so we still want to send SIGKILL.
+		l.Printf("coverage mode: first trying to stop using SIGUSR1")
+		opts := stopOpts.RoachprodOpts
+		opts.Sig = 10 // SIGUSR1
+		opts.Wait = true
+		opts.MaxWait = 10
+		_ = roachprod.Stop(ctx, l, c.MakeNodes(nodes...), opts)
+	}
 	return errors.Wrap(roachprod.Stop(ctx, l, c.MakeNodes(nodes...), stopOpts.RoachprodOpts), "cluster.StopE")
 }
 
@@ -2163,8 +2166,8 @@ func (c *clusterImpl) Wipe(ctx context.Context, preserveCerts bool, nodes ...opt
 }
 
 // Run a command on the specified nodes and call test.Fatal if there is an error.
-func (c *clusterImpl) Run(ctx context.Context, node option.NodeListOption, args ...string) {
-	err := c.RunE(ctx, node, args...)
+func (c *clusterImpl) Run(ctx context.Context, nodes option.NodeListOption, args ...string) {
+	err := c.RunE(ctx, nodes, args...)
 	if err != nil {
 		c.t.Fatal(err)
 	}
@@ -2178,6 +2181,7 @@ func (c *clusterImpl) RunE(ctx context.Context, nodes option.NodeListOption, arg
 	if len(args) == 0 {
 		return errors.New("No command passed")
 	}
+
 	l, logFile, err := c.loggerForCmd(nodes, args...)
 	if err != nil {
 		return err
@@ -2187,7 +2191,10 @@ func (c *clusterImpl) RunE(ctx context.Context, nodes option.NodeListOption, arg
 	cmd := strings.Join(args, " ")
 	c.t.L().Printf("running cmd `%s` on nodes [%v]; details in %s.log", roachprod.TruncateString(cmd, 30), nodes, logFile)
 	l.Printf("> %s", cmd)
-	if err := roachprod.Run(ctx, l, c.MakeNodes(nodes), "", "", c.IsSecure(), l.Stdout, l.Stderr, args); err != nil {
+	if err := roachprod.Run(
+		ctx, l, c.MakeNodes(nodes), "", "", c.IsSecure(),
+		l.Stdout, l.Stderr, args, install.OnNodes(nodes.InstallNodes()),
+	); err != nil {
 		if err := ctx.Err(); err != nil {
 			l.Printf("(note: incoming context was canceled: %s)", err)
 			return err
@@ -2243,7 +2250,10 @@ func (c *clusterImpl) RunWithDetails(
 	}
 
 	l.Printf("> %s", cmd)
-	results, err := roachprod.RunWithDetails(ctx, l, c.MakeNodes(nodes), "" /* SSHOptions */, "" /* processTag */, c.IsSecure(), args)
+	results, err := roachprod.RunWithDetails(
+		ctx, l, c.MakeNodes(nodes), "" /* SSHOptions */, "", /* processTag */
+		c.IsSecure(), args, install.OnNodes(nodes.InstallNodes()),
+	)
 
 	var logFileFull string
 	if l.File != nil {
@@ -2532,7 +2542,9 @@ func (c *clusterImpl) Conn(
 // ConnE returns a SQL connection to the specified node.
 func (c *clusterImpl) ConnE(
 	ctx context.Context, l *logger.Logger, node int, opts ...func(*option.ConnOption),
-) (*gosql.DB, error) {
+) (_ *gosql.DB, retErr error) {
+	// NB: errors.Wrap returns nil if err is nil.
+	defer func() { retErr = errors.Wrapf(retErr, "connecting to node %d", node) }()
 
 	connOptions := &option.ConnOption{}
 	for _, opt := range opts {
@@ -2562,6 +2574,9 @@ func (c *clusterImpl) ConnE(
 		for k, v := range connOptions.Options {
 			vals.Add(k, v)
 		}
+		// connect_timeout is a libpq-specific parameter for the maximum wait for
+		// connection, in seconds.
+		vals.Add("connect_timeout", "60")
 		dataSourceName = dataSourceName + "&" + vals.Encode()
 	}
 	db, err := gosql.Open("postgres", dataSourceName)
@@ -2651,12 +2666,19 @@ func (c *clusterImpl) StopGrafana(ctx context.Context, l *logger.Logger, dumpDir
 func (c *clusterImpl) WipeForReuse(
 	ctx context.Context, l *logger.Logger, newClusterSpec spec.ClusterSpec,
 ) error {
+	if c.IsLocal() {
+		return errors.New("cluster reuse is disabled for local clusters to guarantee a clean slate for each test")
+	}
 	l.PrintfCtx(ctx, "Using existing cluster: %s (arch=%q). Wiping", c.name, c.arch)
 	if err := c.WipeE(ctx, l, false /* preserveCerts */); err != nil {
 		return err
 	}
-	if err := c.RunE(ctx, c.All(), fmt.Sprintf("rm -rf %s %s", perfArtifactsDir, goCoverArtifactsDir)); err != nil {
-		return errors.Wrapf(err, "failed to remove perf/gocover artifacts dirs")
+	// We remove the entire shared user directory between tests to ensure we aren't
+	// reusing files from previous tests, i.e. cockroach binaries, perf artifacts.
+	// N.B. we don't remove the entire home directory to safeguard against this ever
+	// running locally and deleting someone's local directory.
+	if err := c.RunE(ctx, c.All(), fmt.Sprintf("rm -rf /home/%s/*", config.SharedUser)); err != nil {
+		return errors.Wrapf(err, "failed to remove home directory")
 	}
 	if c.localCertsDir != "" {
 		if err := os.RemoveAll(c.localCertsDir); err != nil {
@@ -2704,4 +2726,43 @@ func archForTest(ctx context.Context, l *logger.Logger, testSpec registry.TestSp
 	l.PrintfCtx(ctx, "Using randomly chosen arch=%q, %s", arch, testSpec.Name)
 
 	return arch
+}
+
+// GetPreemptedVMs gets any VMs that were part of the cluster but preempted by cloud vendor.
+func (c *clusterImpl) GetPreemptedVMs(
+	ctx context.Context, l *logger.Logger,
+) ([]vm.PreemptedVM, error) {
+	if c.IsLocal() || !c.spec.UseSpotVMs {
+		return nil, nil
+	}
+
+	pattern := "^" + regexp.QuoteMeta(c.name) + "$" // exact match of the cluster name
+	cloudClusters, err := roachprod.List(l, false, pattern, vm.ListOptions{})
+	if err != nil {
+		return nil, err
+	}
+	cDetails, ok := cloudClusters.Clusters[c.name]
+	if !ok {
+		return nil, errors.Wrapf(errClusterNotFound, "%q", c.name)
+	}
+	// Bucket cDetails.vms by provider
+	providerToVMs := make(map[string][]vm.VM)
+	for _, vm := range cDetails.VMs {
+		providerToVMs[vm.Provider] = append(providerToVMs[vm.Provider], vm)
+	}
+
+	// Iterate through providerToVMs and call preemptedVMs for each provider
+	var allPreemptedVMs []vm.PreemptedVM
+	for provider, vms := range providerToVMs {
+		p := vm.Providers[provider]
+		if p.SupportsSpotVMs() {
+			preemptedVMS, err := p.GetPreemptedSpotVMs(l, vms, cDetails.CreatedAt)
+			if err != nil {
+				l.Errorf("failed to get preempted VMs for provider %s: %s", provider, err)
+				continue
+			}
+			allPreemptedVMs = append(allPreemptedVMs, preemptedVMS...)
+		}
+	}
+	return allPreemptedVMs, nil
 }

@@ -165,7 +165,8 @@ func (ex *connExecutor) addPreparedStmt(
 	return prepared, nil
 }
 
-// prepare prepares the given statement.
+// prepare prepares the given statement. This is used to create the plan in the
+// "extended" pgwire protocol.
 //
 // placeholderHints may contain partial type information for placeholders.
 // prepare will populate the missing types. It can be nil.
@@ -222,6 +223,10 @@ func (ex *connExecutor) prepare(
 			ex.resetPlanner(ctx, p, txn, ex.server.cfg.Clock.PhysicalTime())
 		}
 
+		if err := ex.maybeUpgradeToSerializable(ctx, stmt); err != nil {
+			return err
+		}
+
 		if placeholderHints == nil {
 			placeholderHints = make(tree.PlaceholderTypes, stmt.NumPlaceholders)
 		} else if rawTypeHints != nil {
@@ -268,6 +273,7 @@ func (ex *connExecutor) prepare(
 
 		p.stmt = stmt
 		p.semaCtx.Annotations = tree.MakeAnnotations(stmt.NumAnnotations)
+		p.extendedEvalCtx.Annotations = &p.semaCtx.Annotations
 		flags, err = ex.populatePrepared(ctx, txn, placeholderHints, p, origin)
 		return err
 	}
@@ -277,7 +283,10 @@ func (ex *connExecutor) prepare(
 		if origin != PreparedStatementOriginSessionMigration {
 			return nil, err
 		} else {
-			log.Warningf(ctx, "could not prepare statement during session migration: %v", err)
+			f := tree.NewFmtCtx(tree.FmtMarkRedactionNode | tree.FmtSimple)
+			f.FormatNode(stmt.AST)
+			redactableStmt := f.CloseAndGetString()
+			log.Warningf(ctx, "could not prepare statement during session migration (%s): %v", redactableStmt, err)
 		}
 	}
 

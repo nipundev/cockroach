@@ -241,6 +241,7 @@ func (p *pebbleIterator) setOptions(
 		OnlyReadGuaranteedDurable: durability == GuaranteedDurability,
 		KeyTypes:                  opts.KeyTypes,
 		UseL6Filters:              opts.useL6Filters,
+		CategoryAndQoS:            getCategoryAndQoS(opts.ReadCategory),
 	}
 	p.prefix = opts.Prefix
 
@@ -472,7 +473,7 @@ func (p *pebbleIterator) Next() {
 	p.iter.Next()
 }
 
-// NextEngineKey implements the Engineterator interface.
+// NextEngineKey implements the EngineIterator interface.
 func (p *pebbleIterator) NextEngineKey() (valid bool, err error) {
 	ok := p.iter.Next()
 	// NB: A Pebble Iterator always returns ok==false when an error is
@@ -955,6 +956,11 @@ func (p *pebbleIterator) IsPrefix() bool {
 // CloneContext is part of the EngineIterator interface.
 func (p *pebbleIterator) CloneContext() CloneContext {
 	return CloneContext{rawIter: p.iter, engine: p.parent}
+}
+
+// CanDeterministicallySingleDelete implements the EngineIterator interface.
+func (p *pebbleIterator) CanDeterministicallySingleDelete() (ok bool, err error) {
+	return pebbleiter.CanDeterministicallySingleDelete(p.iter)
 }
 
 func (p *pebbleIterator) getBlockPropertyFilterMask() pebble.BlockPropertyFilterMask {

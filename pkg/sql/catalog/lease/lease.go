@@ -21,12 +21,12 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/rangefeed"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/server/settingswatcher"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
@@ -37,8 +37,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/internal/catkv"
 	"github.com/cockroachdb/cockroach/pkg/sql/enum"
 	"github.com/cockroachdb/cockroach/pkg/sql/isql"
+	"github.com/cockroachdb/cockroach/pkg/sql/regionliveness"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	kvstorage "github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -74,7 +74,6 @@ var LeaseJitterFraction = settings.RegisterFloatSetting(
 	settings.Fraction)
 
 //go:generate stringer -type=SessionBasedLeasingMode
-
 type SessionBasedLeasingMode int64
 
 const (
@@ -109,7 +108,7 @@ var LeaseEnableSessionBasedLeasing = settings.RegisterEnumSetting(
 
 // sessionBasedLeasingModeActive determines if the current mode at least meets
 // the required minimum.
-func (m *Manager) isSessionBasedLeasingModeActive(minimumMode SessionBasedLeasingMode) bool {
+func (m *Manager) sessionBasedLeasingModeAtLeast(minimumMode SessionBasedLeasingMode) bool {
 	return m.getSessionBasedLeasingMode() >= minimumMode
 }
 
@@ -121,27 +120,24 @@ func (m *Manager) getSessionBasedLeasingMode() SessionBasedLeasingMode {
 // WaitForNoVersion returns once there are no unexpired leases left
 // for any version of the descriptor.
 func (m *Manager) WaitForNoVersion(
-	ctx context.Context, id descpb.ID, retryOpts retry.Options,
+	ctx context.Context,
+	id descpb.ID,
+	cachedDatabaseRegions regionliveness.CachedDatabaseRegions,
+	retryOpts retry.Options,
 ) error {
+	versions := []IDVersion{
+		{
+			Name:    fmt.Sprintf("[%d]", id),
+			ID:      id,
+			Version: 0, // Unused any version flag used below.
+		},
+	}
 	for lastCount, r := 0, retry.Start(retryOpts); r.Next(); {
-		// Check to see if there are any leases that still exist on the previous
-		// version of the descriptor.
 		now := m.storage.clock.Now()
-		stmt := fmt.Sprintf(`SELECT count(1) FROM system.public.lease AS OF SYSTEM TIME '%s' WHERE ("descID" = %d AND expiration > $1)`,
-			now.AsOfSystemTime(),
-			id)
-		values, err := m.storage.db.Executor().QueryRowEx(
-			ctx, "count-leases", nil, /* txn */
-			sessiondata.RootUserSessionDataOverride,
-			stmt, now.GoTime(),
-		)
+		count, err := CountLeases(ctx, m.storage.db, cachedDatabaseRegions, m.settings, versions, now, true /*forAnyVersion*/)
 		if err != nil {
 			return err
 		}
-		if values == nil {
-			return errors.New("failed to count leases")
-		}
-		count := int(tree.MustBeDInt(values[0]))
 		if count == 0 {
 			break
 		}
@@ -151,6 +147,10 @@ func (m *Manager) WaitForNoVersion(
 		}
 	}
 	return nil
+}
+
+type RegionProvider interface {
+	Regions(context.Context, *serverpb.RegionsRequest) (*serverpb.RegionsResponse, error)
 }
 
 // WaitForOneVersion returns once there are no unexpired leases on the
@@ -165,7 +165,10 @@ func (m *Manager) WaitForNoVersion(
 // If the descriptor is not found, an error will be returned. The error
 // can be detected by using errors.Is(err, catalog.ErrDescriptorNotFound).
 func (m *Manager) WaitForOneVersion(
-	ctx context.Context, id descpb.ID, retryOpts retry.Options,
+	ctx context.Context,
+	id descpb.ID,
+	regions regionliveness.CachedDatabaseRegions,
+	retryOpts retry.Options,
 ) (desc catalog.Descriptor, _ error) {
 	for lastCount, r := 0, retry.Start(retryOpts); r.Next(); {
 		if err := m.storage.db.KV().Txn(ctx, func(ctx context.Context, txn *kv.Txn) (err error) {
@@ -195,7 +198,7 @@ func (m *Manager) WaitForOneVersion(
 		// version of the descriptor.
 		now := m.storage.clock.Now()
 		descs := []IDVersion{NewIDVersionPrev(desc.GetName(), desc.GetID(), desc.GetVersion())}
-		count, err := CountLeases(ctx, m.storage.db.Executor(), descs, now)
+		count, err := CountLeases(ctx, m.storage.db, regions, m.settings, descs, now, false /*forAnyVersion*/)
 		if err != nil {
 			return nil, err
 		}
@@ -581,6 +584,9 @@ func acquireNodeLease(
 				return nil, err
 			}
 			t := m.findDescriptorState(id, false /* create */)
+			if t == nil {
+				return nil, errors.AssertionFailedf("could not find descriptor state for id %d", id)
+			}
 			t.mu.Lock()
 			t.mu.takenOffline = false
 			defer t.mu.Unlock()
@@ -776,7 +782,6 @@ func NewLeaseManager(
 	lm := &Manager{
 		storage: storage{
 			nodeIDContainer: nodeIDContainer,
-			writer:          newKVWriter(codec, db.KV(), keys.LeaseTableID, settingsWatcher),
 			db:              db,
 			clock:           clock,
 			settings:        settings,
@@ -802,6 +807,7 @@ func NewLeaseManager(
 	lm.storage.regionPrefix = &atomic.Value{}
 	lm.storage.regionPrefix.Store(enum.One)
 	lm.storage.sessionBasedLeasingMode = lm
+	lm.storage.writer = newKVWriter(codec, db.KV(), keys.LeaseTableID, settingsWatcher, lm)
 	lm.stopper.AddCloser(lm.sem.Closer("stopper"))
 	lm.mu.descriptors = make(map[descpb.ID]*descriptorState)
 	lm.mu.updatesResolvedTimestamp = clock.Now()
@@ -1400,18 +1406,9 @@ func (m *Manager) DeleteOrphanedLeases(ctx context.Context, timeThreshold int64)
 		// doesn't implement AS OF SYSTEM TIME.
 
 		// Read orphaned leases.
-		const (
-			queryWithRegion = `
+		query := `
 SELECT "descID", version, expiration, crdb_region FROM system.public.lease AS OF SYSTEM TIME %d WHERE "nodeID" = %d
 `
-			queryWithoutRegion = `
-SELECT "descID", version, expiration FROM system.public.lease AS OF SYSTEM TIME %d WHERE "nodeID" = %d
-`
-		)
-		query := queryWithRegion
-		if !m.settings.Version.IsActive(ctx, clusterversion.TODO_Delete_V23_1_SystemRbrReadNew) {
-			query = queryWithoutRegion
-		}
 		sqlQuery := fmt.Sprintf(query, timeThreshold, instanceID)
 		var rows []tree.Datums
 		retryOptions := base.DefaultRetryOptions()

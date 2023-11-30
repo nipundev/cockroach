@@ -56,6 +56,13 @@ var targetRestoreSpanSize = settings.RegisterByteSizeSetting(
 	384<<20,
 )
 
+var targetOnlineRestoreSpanSize = settings.RegisterByteSizeSetting(
+	settings.ApplicationLevel,
+	"backup.restore_span.online_target_size",
+	"target size to which base spans of an online restore are merged to produce a restore span (0 disables)",
+	8<<30,
+)
+
 // backupManifestFileIterator exposes methods that can be used to iterate over
 // the `BackupManifest_Files` field of a manifest.
 type backupManifestFileIterator interface {
@@ -100,8 +107,7 @@ var _ backupManifestFileIterator = &sstFileIterator{}
 
 // createIntroducedSpanFrontier creates a span frontier that tracks the end time
 // of the latest incremental backup of each introduced span in the backup chain.
-// See ReintroducedSpans( ) for more information. Note: this function assumes
-// that manifests are sorted in increasing EndTime.
+// Note: this function assumes that manifests are sorted in increasing EndTime.
 func createIntroducedSpanFrontier(
 	manifests []backuppb.BackupManifest, asOf hlc.Timestamp,
 ) (*spanUtils.Frontier, error) {

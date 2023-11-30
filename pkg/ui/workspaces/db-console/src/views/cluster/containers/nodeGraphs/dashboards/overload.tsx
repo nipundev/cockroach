@@ -110,27 +110,23 @@ export default function (props: GraphDashboardProps) {
     </LineGraph>,
 
     <LineGraph
-      title="KV Admission Slots"
+      title="KV Admission Slots Exhausted"
       sources={nodeSources}
       tenantSource={tenantSource}
       showMetricsInTooltip={true}
     >
-      <Axis label="slots">
+      <Axis label="duration (micros/sec)">
         {nodeIDs.map(nid => (
-          <>
-            <Metric
-              key={nid}
-              name="cr.node.admission.granter.total_slots.kv"
-              title={"Total Slots " + nodeDisplayName(nodeDisplayNameByID, nid)}
-              sources={[nid]}
-            />
-            <Metric
-              key={nid}
-              name="cr.node.admission.granter.used_slots.kv"
-              title={"Used Slots " + nodeDisplayName(nodeDisplayNameByID, nid)}
-              sources={[nid]}
-            />
-          </>
+          <Metric
+            key={nid}
+            name="cr.node.admission.granter.slots_exhausted_duration.kv"
+            title={
+              "Admission Slots Exhausted " +
+              nodeDisplayName(nodeDisplayNameByID, nid)
+            }
+            sources={[nid]}
+            nonNegativeRate
+          />
         ))}
       </Axis>
     </LineGraph>,
@@ -316,21 +312,21 @@ export default function (props: GraphDashboardProps) {
           <>
             <Metric
               key={nid}
-              name="cr.node.admission.wait_sum.kv"
+              name="cr.node.admission.wait_durations.kv-sum"
               title={"KV " + nodeDisplayName(nodeDisplayNameByID, nid)}
               sources={[nid]}
               nonNegativeRate
             />
             <Metric
               key={nid}
-              name="cr.node.admission.wait_sum.kv-stores"
+              name="cr.node.admission.wait_durations.kv-stores-sum"
               title={"KV write " + nodeDisplayName(nodeDisplayNameByID, nid)}
               sources={[nid]}
               nonNegativeRate
             />
             <Metric
               key={nid}
-              name="cr.node.admission.wait_sum.sql-kv-response"
+              name="cr.node.admission.wait_durations.sql-kv-response-sum"
               title={
                 "SQL-KV response " + nodeDisplayName(nodeDisplayNameByID, nid)
               }
@@ -339,7 +335,7 @@ export default function (props: GraphDashboardProps) {
             />
             <Metric
               key={nid}
-              name="cr.node.admission.wait_sum.sql-sql-response"
+              name="cr.node.admission.wait_durations.sql-sql-response-sum"
               title={
                 "SQL-SQL response " + nodeDisplayName(nodeDisplayNameByID, nid)
               }

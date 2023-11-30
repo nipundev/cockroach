@@ -414,7 +414,7 @@ func NewServer(
 ) *Server {
 	metrics := makeMetrics(false /* internal */)
 	serverMetrics := makeServerMetrics(cfg)
-	insightsProvider := insights.New(cfg.Settings, serverMetrics.InsightsMetrics)
+	insightsProvider := insights.New(cfg.Settings, serverMetrics.InsightsMetrics, eventsExporter)
 	reportedSQLStats := sslocal.New(
 		cfg.Settings,
 		sqlstats.MaxMemReportedSQLStatsStmtFingerprints,
@@ -461,7 +461,7 @@ func NewServer(
 		idxRecommendationsCache: idxrecommendations.NewIndexRecommendationsCache(cfg.Settings),
 	}
 
-	telemetryLoggingMetrics := newTelemetryLoggingmetrics(cfg.TelemetryLoggingTestingKnobs, cfg.Settings)
+	telemetryLoggingMetrics := newTelemetryLoggingMetrics(cfg.TelemetryLoggingTestingKnobs, cfg.Settings)
 	telemetryLoggingMetrics.registerOnTelemetrySamplingModeChange(cfg.Settings)
 	s.TelemetryLoggingMetrics = telemetryLoggingMetrics
 
@@ -480,7 +480,7 @@ func NewServer(
 		FlushCounter:   serverMetrics.StatsMetrics.SQLStatsFlushStarted,
 		FailureCounter: serverMetrics.StatsMetrics.SQLStatsFlushFailure,
 		FlushDuration:  serverMetrics.StatsMetrics.SQLStatsFlushDuration,
-	}, memSQLStats, eventsExporter)
+	}, memSQLStats)
 
 	s.sqlStats = persistedSQLStats
 	s.sqlStatsController = persistedSQLStats.GetController(cfg.SQLStatusServer)
@@ -605,6 +605,7 @@ func (s *Server) Start(ctx context.Context, stopper *stop.Stopper) {
 	// should be accounted for in their costs.
 	ctx = multitenant.WithTenantCostControlExemption(ctx)
 
+	s.insights.Start(ctx, stopper)
 	s.sqlStats.Start(ctx, stopper)
 
 	s.schemaTelemetryController.Start(ctx, stopper)
@@ -613,8 +614,6 @@ func (s *Server) Start(ctx context.Context, stopper *stop.Stopper) {
 	// accumulated in the reporter when the telemetry server fails.
 	// Usually it is telemetry's reporter's job to clear the reporting SQL Stats.
 	s.reportedStats.Start(ctx, stopper)
-
-	s.insights.Start(ctx, stopper)
 
 	s.txnIDCache.Start(ctx, stopper)
 }
@@ -1097,7 +1096,7 @@ func (s *Server) newConnExecutor(
 	// The transaction_read_only variable is special; its updates need to be
 	// hooked-up to the executor.
 	ex.dataMutatorIterator.setCurTxnReadOnly = func(val bool) {
-		ex.state.readOnly = val
+		ex.state.readOnly.Swap(val)
 	}
 	ex.dataMutatorIterator.onTempSchemaCreation = func() {
 		ex.hasCreatedTemporarySchema = true
@@ -1411,6 +1410,10 @@ type connExecutor struct {
 		// transaction has been executed.
 		firstStmtExecuted bool
 
+		// upgradedToSerializable indicates that the transaction has been implicitly
+		// upgraded to the SERIALIZABLE isolation level.
+		upgradedToSerializable bool
+
 		// numDDL keeps track of how many DDL statements have been
 		// executed so far.
 		numDDL int
@@ -1432,7 +1435,7 @@ type connExecutor struct {
 		// Note that a single SQL txn can use multiple KV txns under the
 		// hood with multiple KV txn UUIDs, so the KV UUID is not a good
 		// txn identifier for SQL logging.
-		txnCounter int
+		txnCounter atomic.Int32
 
 		// txnRewindPos is the position within stmtBuf to which we'll rewind when
 		// performing automatic retries. This is more or less the position where the
@@ -1559,11 +1562,6 @@ type connExecutor struct {
 		// has admin privilege. hasAdminRoleCache is set for the first statement
 		// in a transaction.
 		hasAdminRoleCache HasAdminRoleCache
-
-		// roleExistsCache is a cache of role existence checks. This is used because
-		// role existence checks are made when checking privileges. Only positive
-		// values are cached.
-		roleExistsCache map[username.SQLUsername]struct{}
 
 		// createdSequences keeps track of sequences created in the current transaction.
 		// The map key is the sequence descpb.ID.
@@ -1975,8 +1973,8 @@ func (ns *prepStmtNamespace) resetTo(
 func (ex *connExecutor) resetExtraTxnState(ctx context.Context, ev txnEvent, payloadErr error) {
 	ex.extraTxnState.numDDL = 0
 	ex.extraTxnState.firstStmtExecuted = false
+	ex.extraTxnState.upgradedToSerializable = false
 	ex.extraTxnState.hasAdminRoleCache = HasAdminRoleCache{}
-	ex.extraTxnState.roleExistsCache = make(map[username.SQLUsername]struct{})
 	ex.extraTxnState.createdSequences = nil
 
 	if ex.extraTxnState.fromOuterTxn {
@@ -2800,7 +2798,7 @@ func (ex *connExecutor) execCopyOut(
 			ctx,
 			ex.executorType,
 			int(ex.state.mu.autoRetryCounter),
-			ex.extraTxnState.txnCounter,
+			int(ex.extraTxnState.txnCounter.Load()),
 			numOutputRows,
 			ex.state.mu.stmtCount,
 			0, /* bulkJobId */
@@ -3051,7 +3049,7 @@ func (ex *connExecutor) execCopyIn(
 		)
 		var stats topLevelQueryStats
 		ex.planner.maybeLogStatement(ctx, ex.executorType,
-			int(ex.state.mu.autoRetryCounter), ex.extraTxnState.txnCounter,
+			int(ex.state.mu.autoRetryCounter), int(ex.extraTxnState.txnCounter.Load()),
 			numInsertedRows, ex.state.mu.stmtCount,
 			0, /* bulkJobId */
 			copyErr,
@@ -3287,10 +3285,6 @@ var retriableMinTimestampBoundUnsatisfiableError = errors.Newf(
 func errIsRetriable(err error) bool {
 	return errors.HasInterface(err, (*pgerror.ClientVisibleRetryError)(nil)) ||
 		errors.Is(err, retriableMinTimestampBoundUnsatisfiableError) ||
-		// Note that this error is not handled internally and can make it to the
-		// client in implicit transactions. This is not great; it should
-		// be marked as a client visible retry error.
-		errors.Is(err, descidgen.ErrDescIDSequenceMigrationInProgress) ||
 		descs.IsTwoVersionInvariantViolationError(err)
 }
 
@@ -3603,10 +3597,14 @@ func (ex *connExecutor) initEvalCtx(ctx context.Context, evalCtx *extendedEvalCo
 func (ex *connExecutor) resetEvalCtx(evalCtx *extendedEvalContext, txn *kv.Txn, stmtTS time.Time) {
 	newTxn := txn == nil || evalCtx.Txn != txn
 	evalCtx.TxnState = ex.getTransactionState()
-	evalCtx.TxnReadOnly = ex.state.readOnly
+	evalCtx.TxnReadOnly = ex.state.readOnly.Load()
 	evalCtx.TxnImplicit = ex.implicitTxn()
 	evalCtx.TxnIsSingleStmt = false
-	evalCtx.TxnIsoLevel = ex.state.isolationLevel
+	func() {
+		ex.state.mu.Lock()
+		defer ex.state.mu.Unlock()
+		evalCtx.TxnIsoLevel = ex.state.mu.isolationLevel
+	}()
 	if newTxn || !ex.implicitTxn() {
 		// Only update the stmt timestamp if in a new txn or an explicit txn. This is because this gets
 		// called multiple times during an extended protocol implicit txn, but we
@@ -3623,7 +3621,6 @@ func (ex *connExecutor) resetEvalCtx(evalCtx *extendedEvalContext, txn *kv.Txn, 
 	evalCtx.SkipNormalize = false
 	evalCtx.SchemaChangerState = ex.extraTxnState.schemaChangerState
 	evalCtx.DescIDGenerator = ex.getDescIDGenerator()
-	evalCtx.RoleExistsCache = ex.extraTxnState.roleExistsCache
 
 	// See resetPlanner for more context on setting the maximum timestamp for
 	// AOST read retries.
@@ -3752,13 +3749,6 @@ func (ex *connExecutor) txnStateTransitionsApplyWrapper(
 				return advanceInfo{}, err
 			}
 		}
-		// Similarly, if the descriptor ID generator is not available because of
-		// an ongoing migration, wait for the migration to complete first.
-		if errors.Is(payloadErr, descidgen.ErrDescIDSequenceMigrationInProgress) {
-			if err := ex.handleWaitingForDescriptorIDGeneratorMigration(ex.Ctx()); err != nil {
-				return advanceInfo{}, err
-			}
-		}
 	}
 
 	// Handle transaction events which cause updates to txnState.
@@ -3784,11 +3774,10 @@ func (ex *connExecutor) txnStateTransitionsApplyWrapper(
 
 		}
 	case txnStart:
-		ex.extraTxnState.firstStmtExecuted = false
 		ex.recordTransactionStart(advInfo.txnEvent.txnID)
 		// Start of the transaction, so no statements were executed earlier.
 		// Bump the txn counter for logging.
-		ex.extraTxnState.txnCounter++
+		ex.extraTxnState.txnCounter.Add(1)
 
 		// Session is considered active when executing a transaction.
 		ex.totalActiveTimeStopWatch.Start()
@@ -3922,13 +3911,6 @@ func (ex *connExecutor) handleWaitingForConcurrentSchemaChanges(
 	return ex.resetTransactionOnSchemaChangeRetry(ctx)
 }
 
-func (ex *connExecutor) handleWaitingForDescriptorIDGeneratorMigration(ctx context.Context) error {
-	if err := ex.planner.waitForDescriptorIDGeneratorMigration(ctx); err != nil {
-		return err
-	}
-	return ex.resetTransactionOnSchemaChangeRetry(ctx)
-}
-
 // initStatementResult initializes res according to a query.
 //
 // cols represents the columns of the result rows. Should be nil if
@@ -4032,15 +4014,16 @@ func (ex *connExecutor) serialize() serverpb.Session {
 			NumRetries:            int32(txn.Epoch()),
 			NumAutoRetries:        ex.state.mu.autoRetryCounter,
 			TxnDescription:        txn.String(),
-			Implicit:              ex.implicitTxn(),
-			AllocBytes:            ex.state.mon.AllocBytes(),
-			MaxAllocBytes:         ex.state.mon.MaximumBytes(),
-			IsHistorical:          ex.state.isHistorical,
-			ReadOnly:              ex.state.readOnly,
-			Priority:              ex.state.priority.String(),
-			QualityOfService:      sessiondatapb.ToQoSLevelString(txn.AdmissionHeader().Priority),
-			LastAutoRetryReason:   autoRetryReasonStr,
-			IsolationLevel:        tree.IsolationLevelFromKVTxnIsolationLevel(ex.state.isolationLevel).String(),
+			// TODO(yuzefovich): this seems like not a concurrency safe call.
+			Implicit:            ex.implicitTxn(),
+			AllocBytes:          ex.state.mon.AllocBytes(),
+			MaxAllocBytes:       ex.state.mon.MaximumBytes(),
+			IsHistorical:        ex.state.isHistorical.Load(),
+			ReadOnly:            ex.state.readOnly.Load(),
+			Priority:            ex.state.mu.priority.String(),
+			QualityOfService:    sessiondatapb.ToQoSLevelString(txn.AdmissionHeader().Priority),
+			LastAutoRetryReason: autoRetryReasonStr,
+			IsolationLevel:      tree.IsolationLevelFromKVTxnIsolationLevel(ex.state.mu.isolationLevel).String(),
 		}
 	}
 
@@ -4135,15 +4118,17 @@ func (ex *connExecutor) serialize() serverpb.Session {
 	}
 
 	return serverpb.Session{
-		Username:                   sd.SessionUser().Normalized(),
-		ClientAddress:              remoteStr,
-		ApplicationName:            ex.applicationName.Load().(string),
-		Start:                      ex.phaseTimes.GetSessionPhaseTime(sessionphase.SessionInit).UTC(),
-		ActiveQueries:              activeQueries,
-		ActiveTxn:                  activeTxnInfo,
-		NumTxnsExecuted:            int32(ex.extraTxnState.txnCounter),
-		TxnFingerprintIDs:          txnFingerprintIDs,
-		LastActiveQuery:            lastActiveQuery,
+		Username:        sd.SessionUser().Normalized(),
+		ClientAddress:   remoteStr,
+		ApplicationName: ex.applicationName.Load().(string),
+		// TODO(yuzefovich): this seems like not a concurrency safe call.
+		Start:             ex.phaseTimes.GetSessionPhaseTime(sessionphase.SessionInit).UTC(),
+		ActiveQueries:     activeQueries,
+		ActiveTxn:         activeTxnInfo,
+		NumTxnsExecuted:   ex.extraTxnState.txnCounter.Load(),
+		TxnFingerprintIDs: txnFingerprintIDs,
+		LastActiveQuery:   lastActiveQuery,
+		// TODO(yuzefovich): this seems like not a concurrency safe call.
 		ID:                         ex.planner.extendedEvalCtx.SessionID.GetBytes(),
 		AllocBytes:                 ex.mon.AllocBytes(),
 		MaxAllocBytes:              ex.mon.MaximumBytes(),

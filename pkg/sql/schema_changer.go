@@ -18,7 +18,6 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/config"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
@@ -48,13 +47,14 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/regionliveness"
+	"github.com/cockroachdb/cockroach/pkg/sql/regions"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondatapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
-	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/util/admission/admissionpb"
 	"github.com/cockroachdb/cockroach/pkg/util/grpcutil"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
@@ -569,10 +569,9 @@ func startGCJob(
 	userName username.SQLUsername,
 	schemaChangeDescription string,
 	details jobspb.SchemaChangeGCDetails,
-	useLegacyGCJob bool,
 ) error {
 	jobRecord := CreateGCJobRecord(
-		schemaChangeDescription, userName, details, useLegacyGCJob,
+		schemaChangeDescription, userName, details,
 	)
 	jobID := jobRegistry.MakeJobID()
 	if err := db.Txn(ctx, func(ctx context.Context, txn isql.Txn) error {
@@ -753,7 +752,11 @@ func (sc *SchemaChanger) exec(ctx context.Context) error {
 	// returns, so that the new schema is live everywhere. This is not needed for
 	// correctness but is done to make the UI experience/tests predictable.
 	waitToUpdateLeases := func(refreshStats bool) error {
-		latestDesc, err := WaitToUpdateLeases(ctx, sc.leaseMgr, sc.descID)
+		cachedRegions, err := regions.NewCachedDatabaseRegions(ctx, sc.db.KV(), sc.leaseMgr)
+		if err != nil {
+			return err
+		}
+		latestDesc, err := WaitToUpdateLeases(ctx, sc.leaseMgr, cachedRegions, sc.descID)
 		if err != nil {
 			if errors.Is(err, catalog.ErrDescriptorNotFound) {
 				return err
@@ -824,7 +827,6 @@ func (sc *SchemaChanger) exec(ctx context.Context) error {
 				sc.job.Payload().UsernameProto.Decode(),
 				sc.job.Payload().Description,
 				gcDetails,
-				!storage.CanUseMVCCRangeTombstones(ctx, sc.settings),
 			); err != nil {
 				return err
 			}
@@ -947,7 +949,11 @@ func (sc *SchemaChanger) handlePermanentSchemaChangeError(
 	// returns, so that the new schema is live everywhere. This is not needed for
 	// correctness but is done to make the UI experience/tests predictable.
 	waitToUpdateLeases := func(refreshStats bool) error {
-		desc, err := WaitToUpdateLeases(ctx, sc.leaseMgr, sc.descID)
+		cachedRegions, err := regions.NewCachedDatabaseRegions(ctx, sc.db.KV(), sc.leaseMgr)
+		if err != nil {
+			return err
+		}
+		desc, err := WaitToUpdateLeases(ctx, sc.leaseMgr, cachedRegions, sc.descID)
 		if err != nil {
 			if errors.Is(err, catalog.ErrDescriptorNotFound) {
 				return err
@@ -1003,10 +1009,7 @@ func (sc *SchemaChanger) initJobRunningStatus(ctx context.Context) error {
 			}
 		}
 		if runStatus != "" && !desc.Dropped() {
-			if err := sc.job.WithTxn(txn).RunningStatus(
-				ctx, func(ctx context.Context, details jobspb.Details) (jobs.RunningStatus, error) {
-					return runStatus, nil
-				}); err != nil {
+			if err := sc.job.WithTxn(txn).RunningStatus(ctx, runStatus); err != nil {
 				return errors.Wrapf(err, "failed to update job status")
 			}
 		}
@@ -1160,7 +1163,6 @@ func (sc *SchemaChanger) rollbackSchemaChange(ctx context.Context, err error) er
 					},
 				},
 			},
-			!storage.CanUseMVCCRangeTombstones(ctx, sc.settings),
 		)
 		if _, err := sc.jobRegistry.CreateJobWithTxn(ctx, jobRecord, gcJobID, txn); err != nil {
 			return err
@@ -1244,11 +1246,7 @@ func (sc *SchemaChanger) RunStateMachineBeforeBackfill(ctx context.Context) erro
 			return err
 		}
 		if sc.job != nil {
-			if err := sc.job.WithTxn(txn).RunningStatus(ctx, func(
-				ctx context.Context, details jobspb.Details,
-			) (jobs.RunningStatus, error) {
-				return runStatus, nil
-			}); err != nil {
+			if err := sc.job.WithTxn(txn).RunningStatus(ctx, runStatus); err != nil {
 				return errors.Wrap(err, "failed to update job status")
 			}
 		}
@@ -1325,11 +1323,7 @@ func (sc *SchemaChanger) stepStateMachineAfterIndexBackfill(ctx context.Context)
 			return err
 		}
 		if sc.job != nil {
-			if err := sc.job.WithTxn(txn).RunningStatus(ctx, func(
-				ctx context.Context, details jobspb.Details,
-			) (jobs.RunningStatus, error) {
-				return runStatus, nil
-			}); err != nil {
+			if err := sc.job.WithTxn(txn).RunningStatus(ctx, runStatus); err != nil {
 				return errors.Wrap(err, "failed to update job status")
 			}
 		}
@@ -1369,7 +1363,6 @@ func (sc *SchemaChanger) createIndexGCJobWithDropTime(
 
 	gcJobRecord := CreateGCJobRecord(
 		jobDesc, sc.job.Payload().UsernameProto.Decode(), indexGCDetails,
-		!sc.settings.Version.IsActive(ctx, clusterversion.TODO_Delete_V23_1_UseDelRangeInGCJob),
 	)
 	jobID := sc.jobRegistry.MakeJobID()
 	if _, err := sc.jobRegistry.CreateJobWithTxn(ctx, gcJobRecord, jobID, txn); err != nil {
@@ -1383,7 +1376,10 @@ func (sc *SchemaChanger) createIndexGCJobWithDropTime(
 // WaitToUpdateLeases until the entire cluster has been updated to the latest
 // version of the descriptor.
 func WaitToUpdateLeases(
-	ctx context.Context, leaseMgr *lease.Manager, descID descpb.ID,
+	ctx context.Context,
+	leaseMgr *lease.Manager,
+	regions regionliveness.CachedDatabaseRegions,
+	descID descpb.ID,
 ) (catalog.Descriptor, error) {
 	// Aggressively retry because there might be a user waiting for the
 	// schema change to complete.
@@ -1394,7 +1390,7 @@ func WaitToUpdateLeases(
 	}
 	start := timeutil.Now()
 	log.Infof(ctx, "waiting for a single version...")
-	desc, err := leaseMgr.WaitForOneVersion(ctx, descID, retryOpts)
+	desc, err := leaseMgr.WaitForOneVersion(ctx, descID, regions, retryOpts)
 	if err != nil {
 		return nil, err
 	}
@@ -1562,30 +1558,40 @@ func (sc *SchemaChanger) done(ctx context.Context) error {
 				}
 			}
 
-			// If a primary index swap or any indexes are being dropped clean up any
-			// comments related to it.
+			// If `m` is a primary index swap, which results in creations of a primary
+			// index and possibly new, rewritten, secondary indexes, carry over the
+			// comments associated with the old indexes to the new ones.
 			if pkSwap := m.AsPrimaryKeySwap(); pkSwap != nil {
-				id := pkSwap.PrimaryKeySwapDesc().OldPrimaryIndexId
-				commentsToDelete = append(commentsToDelete,
-					commentToDelete{
-						id:          int64(scTable.GetID()),
-						subID:       int64(id),
-						commentType: catalogkeys.IndexCommentType,
-					})
-				for i := range pkSwap.PrimaryKeySwapDesc().OldIndexes {
-					// Skip the primary index.
-					if pkSwap.PrimaryKeySwapDesc().OldIndexes[i] == id {
-						continue
+				pkSwapDesc := pkSwap.PrimaryKeySwapDesc()
+				oldIndexIDs := append([]descpb.IndexID{pkSwapDesc.OldPrimaryIndexId}, pkSwapDesc.OldIndexes...)
+				newIndexIDs := append([]descpb.IndexID{pkSwapDesc.NewPrimaryIndexId}, pkSwapDesc.NewIndexes...)
+				for i := range oldIndexIDs {
+					oldIndexDesc, err := catalog.MustFindIndexByID(scTable, oldIndexIDs[i])
+					if err != nil {
+						return err
 					}
-					// Set up a swap operation for any re-created indexes.
+					newIndexDesc, err := catalog.MustFindIndexByID(scTable, newIndexIDs[i])
+					if err != nil {
+						return err
+					}
 					commentsToSwap = append(commentsToSwap,
 						commentToSwap{
 							id:          int64(scTable.GetID()),
-							oldSubID:    int64(pkSwap.PrimaryKeySwapDesc().OldIndexes[i]),
-							newSubID:    int64(pkSwap.PrimaryKeySwapDesc().NewIndexes[i]),
+							oldSubID:    int64(oldIndexDesc.GetID()),
+							newSubID:    int64(newIndexDesc.GetID()),
 							commentType: catalogkeys.IndexCommentType,
-						},
-					)
+						})
+					// If index backs a PRIMARY KEY or UNIQUE constraint, carry over the comments associated
+					// with the constraint as well.
+					if oldIndexDesc.IsUnique() {
+						commentsToSwap = append(commentsToSwap,
+							commentToSwap{
+								id:          int64(scTable.GetID()),
+								oldSubID:    int64(oldIndexDesc.GetConstraintID()),
+								newSubID:    int64(newIndexDesc.GetConstraintID()),
+								commentType: catalogkeys.ConstraintCommentType,
+							})
+					}
 				}
 			}
 
@@ -2366,10 +2372,7 @@ func (sc *SchemaChanger) reverseMutation(
 // CreateGCJobRecord creates the job record for a GC job, setting some
 // properties which are common for all GC jobs.
 func CreateGCJobRecord(
-	originalDescription string,
-	userName username.SQLUsername,
-	details jobspb.SchemaChangeGCDetails,
-	useLegacyGCJob bool,
+	originalDescription string, userName username.SQLUsername, details jobspb.SchemaChangeGCDetails,
 ) jobs.Record {
 	descriptorIDs := make([]descpb.ID, 0)
 	if len(details.Indexes) > 0 {
@@ -2382,9 +2385,6 @@ func CreateGCJobRecord(
 		}
 	}
 	runningStatus := RunningStatusDeletingData
-	if useLegacyGCJob {
-		runningStatus = RunningStatusWaitingGC
-	}
 	return jobs.Record{
 		Description:   fmt.Sprintf("GC for %s", originalDescription),
 		Username:      userName,
@@ -2812,7 +2812,6 @@ func (r schemaChangeResumer) Resume(ctx context.Context, execCtx interface{}) er
 			r.job.Payload().UsernameProto.Decode(),
 			r.job.Payload().Description,
 			multiTableGCDetails,
-			!storage.CanUseMVCCRangeTombstones(ctx, p.ExecCfg().Settings),
 		); err != nil {
 			return err
 		}

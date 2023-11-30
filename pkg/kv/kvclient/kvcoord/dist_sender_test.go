@@ -53,7 +53,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
-	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/errors/errutil"
 	"github.com/cockroachdb/redact"
@@ -385,7 +384,6 @@ func TestSendRPCOrder(t *testing.T) {
 	old := CanSendToFollower
 	defer func() { CanSendToFollower = old }()
 	CanSendToFollower = func(
-		_ uuid.UUID,
 		_ *cluster.Settings,
 		_ *hlc.Clock,
 		p roachpb.RangeClosedTimestampPolicy,
@@ -893,7 +891,6 @@ func TestNoBackoffOnNotLeaseHolderErrorFromFollowerRead(t *testing.T) {
 	old := CanSendToFollower
 	defer func() { CanSendToFollower = old }()
 	CanSendToFollower = func(
-		_ uuid.UUID,
 		_ *cluster.Settings,
 		_ *hlc.Clock,
 		_ roachpb.RangeClosedTimestampPolicy,
@@ -3975,7 +3972,6 @@ func TestCanSendToFollower(t *testing.T) {
 	defer func() { CanSendToFollower = old }()
 	canSend := true
 	CanSendToFollower = func(
-		_ uuid.UUID,
 		_ *cluster.Settings,
 		_ *hlc.Clock,
 		_ roachpb.RangeClosedTimestampPolicy,
@@ -5398,17 +5394,21 @@ func TestDistSenderComputeNetworkCost(t *testing.T) {
 		return desc
 	}
 
+	makeLocality := func(region string) roachpb.Locality {
+		return roachpb.Locality{
+			Tiers: []roachpb.Tier{
+				{Key: "az", Value: fmt.Sprintf("az%d", rand.Intn(10))},
+				{Key: "region", Value: region},
+				{Key: "dc", Value: fmt.Sprintf("dc%d", rand.Intn(10))},
+			},
+		}
+	}
+
 	makeNodeDescriptor := func(nodeID int, region string) roachpb.NodeDescriptor {
 		return roachpb.NodeDescriptor{
-			NodeID:  roachpb.NodeID(nodeID),
-			Address: util.UnresolvedAddr{},
-			Locality: roachpb.Locality{
-				Tiers: []roachpb.Tier{
-					{Key: "az", Value: fmt.Sprintf("az%d", rand.Intn(10))},
-					{Key: "region", Value: region},
-					{Key: "dc", Value: fmt.Sprintf("dc%d", rand.Intn(10))},
-				},
-			},
+			NodeID:   roachpb.NodeID(nodeID),
+			Address:  util.UnresolvedAddr{},
+			Locality: makeLocality(region),
 		}
 	}
 
@@ -5417,11 +5417,7 @@ func TestDistSenderComputeNetworkCost(t *testing.T) {
 			ReplicaDescriptor: roachpb.ReplicaDescriptor{
 				ReplicaID: roachpb.ReplicaID(replicaID),
 			},
-			Tiers: []roachpb.Tier{
-				{Key: "az", Value: fmt.Sprintf("az%d", rand.Intn(10))},
-				{Key: "region", Value: region},
-				{Key: "dc", Value: fmt.Sprintf("dc%d", rand.Intn(10))},
-			},
+			Locality: makeLocality(region),
 		}
 	}
 

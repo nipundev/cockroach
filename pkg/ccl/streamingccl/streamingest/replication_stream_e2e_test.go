@@ -1143,6 +1143,11 @@ func TestTenantStreamingRetryLoadJob(t *testing.T) {
 	c, cleanup := replicationtestutils.CreateTenantStreamingClusters(ctx, t, args)
 	defer cleanup()
 
+	// Inject an error to fail the resumer.
+	mu.Lock()
+	knobLoadErr = errors.Newf("test error")
+	mu.Unlock()
+
 	producerJobID, ingestionJobID := c.StartStreamReplication(ctx)
 	jobutils.WaitForJobToRun(c.T, c.SrcSysSQL, jobspb.JobID(producerJobID))
 	jobutils.WaitForJobToRun(c.T, c.DestSysSQL, jobspb.JobID(ingestionJobID))
@@ -1150,24 +1155,13 @@ func TestTenantStreamingRetryLoadJob(t *testing.T) {
 	srcTime := c.SrcCluster.Server(0).Clock().Now()
 	c.WaitUntilReplicatedTime(srcTime, jobspb.JobID(ingestionJobID))
 
-	c.SrcSysSQL.Exec(t, fmt.Sprintf("PAUSE JOB %d", producerJobID))
-	jobutils.WaitForJobToPause(t, c.SrcSysSQL, jobspb.JobID(producerJobID))
-
-	// Write a bit more to be verified at the end.
-	c.SrcTenantSQL.Exec(t, "INSERT INTO d.t2 VALUES (3);")
-
-	// Inject an error to fail the resumer.
-	mu.Lock()
-	knobLoadErr = errors.Newf("test error")
-	mu.Unlock()
-
-	// Resume ingestion.
-	c.SrcSysSQL.Exec(t, fmt.Sprintf("RESUME JOB %d", producerJobID))
-	jobutils.WaitForJobToRun(t, c.SrcSysSQL, jobspb.JobID(producerJobID))
-
 	// Wait for the resumer to see the error and clear it, after this it should
 	// succeed resuming.
 	<-knobDoneCh
+	require.NoError(t, knobLoadErr)
+
+	// Write a bit more to be verified at the end.
+	c.SrcTenantSQL.Exec(t, "INSERT INTO d.t2 VALUES (3);")
 
 	// Verify the job succeeds now.
 	srcTime = c.SrcCluster.Server(0).Clock().Now()
@@ -1192,14 +1186,12 @@ func TestLoadProducerAndIngestionProgress(t *testing.T) {
 	c.WaitUntilReplicatedTime(srcTime, jobspb.JobID(replicationJobID))
 
 	srcDB := c.SrcSysServer.ExecutorConfig().(sql.ExecutorConfig).InternalDB
-	producerProgress, err := replicationutils.LoadReplicationProgress(ctx, srcDB, jobspb.JobID(producerJobID),
-		c.SrcSysServer.ExecutorConfig().(sql.ExecutorConfig).Settings.Version)
+	producerProgress, err := replicationutils.LoadReplicationProgress(ctx, srcDB, jobspb.JobID(producerJobID))
 	require.NoError(t, err)
 	require.Equal(t, jobspb.StreamReplicationProgress_NOT_FINISHED, producerProgress.StreamIngestionStatus)
 
 	destDB := c.DestSysServer.ExecutorConfig().(sql.ExecutorConfig).InternalDB
-	ingestionProgress, err := replicationutils.LoadIngestionProgress(ctx, destDB, jobspb.JobID(replicationJobID),
-		c.DestSysServer.ExecutorConfig().(sql.ExecutorConfig).Settings.Version)
+	ingestionProgress, err := replicationutils.LoadIngestionProgress(ctx, destDB, jobspb.JobID(replicationJobID))
 	require.NoError(t, err)
 	require.Equal(t, jobspb.Replicating, ingestionProgress.ReplicationStatus)
 }
@@ -1304,6 +1296,7 @@ func TestStreamingMismatchedMRDatabase(t *testing.T) {
 	c.SrcTenantSQL.Exec(t, "CREATE TABLE many.x (id INT PRIMARY KEY, n INT)")
 	c.SrcTenantSQL.Exec(t, "INSERT INTO many.x VALUES (1, 1)")
 
+	c.WaitUntilStartTimeReached(jobspb.JobID(ingestionJobID))
 	srcTime := c.SrcCluster.Server(0).Clock().Now()
 	c.Cutover(producerJobID, ingestionJobID, srcTime.GoTime(), false)
 
@@ -1354,4 +1347,62 @@ WHERE
 	var locality string
 	sysSQL.QueryRow(t, distinctQuery).Scan(&locality)
 	require.Contains(t, locality, region)
+}
+
+// TestStreamingZoneConfigsMismatchedRegions tests that c2c cutover proceeds
+// smoothly even if the user replicated an unsatisfiable zone config.
+func TestStreamingZoneConfigsMismatchedRegions(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	skip.UnderStressRace(t, "takes too long under stress race")
+
+	ctx := context.Background()
+	regions := []string{"mars", "venus", "mercury"}
+	args := replicationtestutils.DefaultTenantStreamingClustersArgs
+	args.SrcClusterTestRegions = regions
+	args.SrcNumNodes = 3
+
+	c, cleanup := replicationtestutils.CreateTenantStreamingClusters(ctx, t, args)
+	defer cleanup()
+
+	producerJobID, ingestionJobID := c.StartStreamReplication(ctx)
+	jobutils.WaitForJobToRun(c.T, c.SrcSysSQL, jobspb.JobID(producerJobID))
+	jobutils.WaitForJobToRun(c.T, c.DestSysSQL, jobspb.JobID(ingestionJobID))
+
+	c.SrcTenantSQL.Exec(t, "CREATE DATABASE test")
+	c.SrcTenantSQL.Exec(t, `ALTER DATABASE test CONFIGURE ZONE USING constraints = '[+region=mars]', num_replicas = 1;`)
+	c.SrcTenantSQL.Exec(t, "CREATE TABLE test.x (id INT PRIMARY KEY, n INT)")
+	c.SrcTenantSQL.Exec(t, "INSERT INTO test.x VALUES (1, 1)")
+
+	c.WaitUntilStartTimeReached(jobspb.JobID(ingestionJobID))
+	srcTime := c.SrcCluster.Server(0).Clock().Now()
+	c.Cutover(producerJobID, ingestionJobID, srcTime.GoTime(), false)
+
+	cleanupTenant := c.StartDestTenant(ctx, nil, 0)
+	defer func() {
+		require.NoError(t, cleanupTenant())
+	}()
+
+	// Note that the unsatisfiable zone config does not appear in the create statement.
+	var res string
+	c.DestTenantSQL.QueryRow(c.T, `SELECT create_statement FROM [SHOW CREATE DATABASE test]`).Scan(&res)
+	require.Equal(t, "CREATE DATABASE test", res)
+
+	var zcfg string
+	c.DestTenantSQL.QueryRow(c.T, `SELECT raw_config_sql FROM [SHOW ZONE CONFIGURATION FROM DATABASE test]`).Scan(&zcfg)
+	// Note that the Zone configuration contains an unsatisfiable region constraint.
+	require.Contains(t, zcfg, `region=mars`)
+
+	// Ensure the db's table is available
+	c.DestTenantSQL.Exec(t, "INSERT INTO test.x VALUES (2, 2)")
+	var rowCount int
+	c.DestTenantSQL.QueryRow(t, "SELECT count(*) FROM test.x").Scan(&rowCount)
+	require.Equal(t, 2, rowCount)
+
+	// Ensure we can remove the unsatsfiable region constraint
+	c.DestTenantSQL.Exec(t, `ALTER DATABASE test CONFIGURE ZONE DISCARD`)
+
+	var newZcfg string
+	c.DestTenantSQL.QueryRow(c.T, `SELECT raw_config_sql FROM [SHOW ZONE CONFIGURATION FROM DATABASE test]`).Scan(&zcfg)
+	require.NotContains(t, newZcfg, `region=mars`)
 }

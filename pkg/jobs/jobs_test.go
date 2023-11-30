@@ -1193,13 +1193,13 @@ func checkTraceFiles(
 
 	recordings := make([][]byte, 0)
 	execCfg := s.ApplicationLayer().ExecutorConfig().(sql.ExecutorConfig)
-	edFiles, err := jobs.ListExecutionDetailFiles(ctx, execCfg.InternalDB, jobID, execCfg.Settings.Version)
+	edFiles, err := jobs.ListExecutionDetailFiles(ctx, execCfg.InternalDB, jobID)
 	require.NoError(t, err)
 	require.Len(t, edFiles, expectedNumFiles)
 
 	require.NoError(t, execCfg.InternalDB.Txn(ctx, func(ctx context.Context, txn isql.Txn) error {
 		for _, f := range edFiles {
-			data, err := jobs.ReadExecutionDetailFile(ctx, f, txn, jobID, execCfg.Settings.Version)
+			data, err := jobs.ReadExecutionDetailFile(ctx, f, txn, jobID)
 			if err != nil {
 				return err
 			}
@@ -1657,7 +1657,7 @@ func TestJobLifecycle(t *testing.T) {
 		}
 		for _, ts := range highWaters {
 			require.NoError(t, job.NoTxn().Update(ctx, func(_ isql.Txn, md jobs.JobMetadata, ju *jobs.JobUpdater) error {
-				return jobs.UpdateHighwaterProgressed(ts, md, ju)
+				return ju.UpdateHighwaterProgressed(ts, md)
 			}))
 			p := job.Progress()
 			if actual := *p.GetHighWater(); actual != ts {
@@ -1678,7 +1678,7 @@ func TestJobLifecycle(t *testing.T) {
 			t.Fatalf("expected 'outside allowable range' error, but got %v", err)
 		}
 		if err := job.NoTxn().Update(ctx, func(_ isql.Txn, md jobs.JobMetadata, ju *jobs.JobUpdater) error {
-			return jobs.UpdateHighwaterProgressed(hlc.Timestamp{WallTime: -1}, md, ju)
+			return ju.UpdateHighwaterProgressed(hlc.Timestamp{WallTime: -1}, md)
 		}); !testutils.IsError(err, "outside allowable range") {
 			t.Fatalf("expected 'outside allowable range' error, but got %v", err)
 		}
@@ -3691,7 +3691,7 @@ func TestLoadJobProgress(t *testing.T) {
 	_, err := r.CreateJobWithTxn(ctx, rec, 7, nil)
 	require.NoError(t, err)
 
-	p, err := jobs.LoadJobProgress(ctx, s.InternalDB().(isql.DB), 7, s.ClusterSettings().Version)
+	p, err := jobs.LoadJobProgress(ctx, s.InternalDB().(isql.DB), 7)
 	require.NoError(t, err)
 	require.Equal(t, []float32{7.1}, p.GetDetails().(*jobspb.Progress_Import).Import.ReadProgress)
 }

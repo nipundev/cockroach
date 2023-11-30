@@ -40,13 +40,14 @@ import (
 	"strconv"
 
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/server/apiconstants"
 	"github.com/cockroachdb/cockroach/pkg/server/apiutil"
 	"github.com/cockroachdb/cockroach/pkg/server/authserver"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/server/srverrors"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
-	"github.com/cockroachdb/cockroach/pkg/sql/roleoption"
+	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/util/httputil"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	"github.com/gorilla/mux"
@@ -142,8 +143,6 @@ func newAPIV2Server(ctx context.Context, opts *apiV2ServerOpts) http.Handler {
 func registerRoutes(
 	innerMux *mux.Router, authMux http.Handler, a *apiV2Server, systemRoutes ApiV2System,
 ) {
-	var noOption roleoption.Option
-
 	// Add any new API endpoint definitions here, even if a sub-server handles
 	// them. Arguments:
 	//
@@ -165,32 +164,31 @@ func registerRoutes(
 		handler       http.HandlerFunc
 		requiresAuth  bool
 		role          authserver.APIRole
-		option        roleoption.Option
 		tenantEnabled bool
 	}{
 		// Pass through auth-related endpoints to the auth server.
-		{"login/", a.authServer.ServeHTTP, false /* requiresAuth */, authserver.RegularRole, noOption, false},
-		{"logout/", a.authServer.ServeHTTP, false /* requiresAuth */, authserver.RegularRole, noOption, false},
+		{"login/", a.authServer.ServeHTTP, false /* requiresAuth */, authserver.RegularRole, false},
+		{"logout/", a.authServer.ServeHTTP, false /* requiresAuth */, authserver.RegularRole, false},
 
 		// Directly register other endpoints in the api server.
-		{"sessions/", a.listSessions, true /* requiresAuth */, authserver.AdminRole, noOption, false},
-		{"nodes/", systemRoutes.listNodes, true, authserver.AdminRole, noOption, false},
+		{"sessions/", a.listSessions, true /* requiresAuth */, authserver.ViewClusterMetadataRole, false},
+		{"nodes/", systemRoutes.listNodes, true, authserver.ViewClusterMetadataRole, false},
 		// Any endpoint returning range information requires an admin user. This is because range start/end keys
 		// are sensitive info.
-		{"nodes/{node_id}/ranges/", systemRoutes.listNodeRanges, true, authserver.AdminRole, noOption, false},
-		{"ranges/hot/", a.listHotRanges, true, authserver.AdminRole, noOption, false},
-		{"ranges/{range_id:[0-9]+}/", a.listRange, true, authserver.AdminRole, noOption, false},
-		{"health/", systemRoutes.health, false, authserver.RegularRole, noOption, false},
-		{"users/", a.listUsers, true, authserver.RegularRole, noOption, false},
-		{"events/", a.listEvents, true, authserver.AdminRole, noOption, false},
-		{"databases/", a.listDatabases, true, authserver.RegularRole, noOption, false},
-		{"databases/{database_name:[\\w.]+}/", a.databaseDetails, true, authserver.RegularRole, noOption, false},
-		{"databases/{database_name:[\\w.]+}/grants/", a.databaseGrants, true, authserver.RegularRole, noOption, false},
-		{"databases/{database_name:[\\w.]+}/tables/", a.databaseTables, true, authserver.RegularRole, noOption, false},
-		{"databases/{database_name:[\\w.]+}/tables/{table_name:[\\w.]+}/", a.tableDetails, true, authserver.RegularRole, noOption, false},
-		{"rules/", a.listRules, false, authserver.RegularRole, noOption, true},
+		{"nodes/{node_id}/ranges/", systemRoutes.listNodeRanges, true, authserver.ViewClusterMetadataRole, false},
+		{"ranges/hot/", a.listHotRanges, true, authserver.ViewClusterMetadataRole, false},
+		{"ranges/{range_id:[0-9]+}/", a.listRange, true, authserver.ViewClusterMetadataRole, false},
+		{"health/", systemRoutes.health, false, authserver.RegularRole, false},
+		{"users/", a.listUsers, true, authserver.RegularRole, false},
+		{"events/", a.listEvents, true, authserver.ViewClusterMetadataRole, false},
+		{"databases/", a.listDatabases, true, authserver.RegularRole, false},
+		{"databases/{database_name:[\\w.]+}/", a.databaseDetails, true, authserver.RegularRole, false},
+		{"databases/{database_name:[\\w.]+}/grants/", a.databaseGrants, true, authserver.RegularRole, false},
+		{"databases/{database_name:[\\w.]+}/tables/", a.databaseTables, true, authserver.RegularRole, false},
+		{"databases/{database_name:[\\w.]+}/tables/{table_name:[\\w.]+}/", a.tableDetails, true, authserver.RegularRole, false},
+		{"rules/", a.listRules, false, authserver.RegularRole, true},
 
-		{"sql/", a.execSQL, true, authserver.RegularRole, noOption, true},
+		{"sql/", a.execSQL, true, authserver.RegularRole, true},
 	}
 
 	// For all routes requiring authentication, have the outer mux (a.mux)
@@ -207,15 +205,25 @@ func registerRoutes(
 				http.Error(w, "Not Available on Tenants", http.StatusNotImplemented)
 			}))
 		}
+
+		// Tell the authz server how to connect to SQL.
+		authzAccessorFactory := func(ctx context.Context, opName string) (sql.AuthorizationAccessor, func()) {
+			txn := a.db.NewTxn(ctx, opName)
+			p, cleanup := sql.NewInternalPlanner(
+				opName,
+				txn,
+				username.RootUserName(),
+				&sql.MemoryMetrics{},
+				a.sqlServer.execCfg,
+				sql.NewInternalSessionData(ctx, a.sqlServer.execCfg.Settings, opName),
+			)
+			return p.(sql.AuthorizationAccessor), cleanup
+		}
+
 		if route.requiresAuth {
 			a.mux.Handle(apiconstants.APIV2Path+route.url, authMux)
 			if route.role != authserver.RegularRole {
-				handler = authserver.NewRoleAuthzMux(
-					a.sqlServer.internalExecutor,
-					route.role,
-					route.option,
-					handler,
-				)
+				handler = authserver.NewRoleAuthzMux(authzAccessorFactory, route.role, handler)
 			}
 			innerMux.Handle(apiconstants.APIV2Path+route.url, handler)
 		} else {

@@ -270,7 +270,7 @@ func (c *SyncedCluster) servicesWithOpenPortSelection(
 ) (ServiceDescriptors, error) {
 	var mu syncutil.Mutex
 	var servicesToRegister ServiceDescriptors
-	err := c.Parallel(ctx, l, c.Nodes, func(ctx context.Context, node Node) (*RunResultDetails, error) {
+	err := c.Parallel(ctx, l, OnNodes(c.Nodes), func(ctx context.Context, node Node) (*RunResultDetails, error) {
 		services := make(ServiceDescriptors, 0)
 		res := &RunResultDetails{Node: node}
 		if _, ok := serviceMap[node][ServiceTypeSQL]; !ok {
@@ -406,17 +406,24 @@ func (c *SyncedCluster) Start(ctx context.Context, l *logger.Logger, startOpts S
 	}
 
 	if !startOpts.SkipInit {
-		if err := c.waitForDefaultTargetCluster(ctx, l, startOpts); err != nil {
-			return errors.Wrap(err, "failed to wait for default target cluster")
+		storageCluster := c
+		if startOpts.KVCluster != nil {
+			storageCluster = startOpts.KVCluster
+		}
+		if startOpts.Target == StartDefault {
+			if err := storageCluster.waitForDefaultTargetCluster(ctx, l, startOpts); err != nil {
+				return errors.Wrap(err, "failed to wait for default target cluster")
+			}
+			// Only after a successful cluster initialization should we attempt to schedule backups.
+			if startOpts.ScheduleBackups && shouldInit && config.CockroachDevLicense != "" {
+				if err := c.createFixedBackupSchedule(ctx, l, startOpts.ScheduleBackupArgs); err != nil {
+					return err
+				}
+			}
 		}
 		c.createAdminUserForSecureCluster(ctx, l, startOpts)
-		if err = c.setClusterSettings(ctx, l, startOpts.GetInitTarget(), startOpts.VirtualClusterName); err != nil {
+		if err = storageCluster.setClusterSettings(ctx, l, startOpts.GetInitTarget(), startOpts.VirtualClusterName); err != nil {
 			return err
-		}
-
-		// Only after a successful cluster initialization should we attempt to schedule backups.
-		if startOpts.ScheduleBackups && shouldInit && config.CockroachDevLicense != "" {
-			return c.createFixedBackupSchedule(ctx, l, startOpts.ScheduleBackupArgs)
 		}
 	}
 
@@ -559,21 +566,22 @@ func (c *SyncedCluster) ExecSQL(
 	args []string,
 ) ([]*RunResultDetails, error) {
 	display := fmt.Sprintf("%s: executing sql", c.Name)
-	results, _, err := c.ParallelE(ctx, l, nodes, func(ctx context.Context, node Node) (*RunResultDetails, error) {
-		desc, err := c.DiscoverService(ctx, node, virtualClusterName, ServiceTypeSQL, sqlInstance)
-		if err != nil {
-			return nil, err
-		}
-		var cmd string
-		if c.IsLocal() {
-			cmd = fmt.Sprintf(`cd %s ; `, c.localVMDir(node))
-		}
-		cmd += cockroachNodeBinary(c, node) + " sql --url " +
-			c.NodeURL("localhost", desc.Port, virtualClusterName, desc.ServiceMode) + " " +
-			ssh.Escape(args)
+	results, _, err := c.ParallelE(ctx, l, OnNodes(nodes).WithDisplay(display).WithFailSlow(),
+		func(ctx context.Context, node Node) (*RunResultDetails, error) {
+			desc, err := c.DiscoverService(ctx, node, virtualClusterName, ServiceTypeSQL, sqlInstance)
+			if err != nil {
+				return nil, err
+			}
+			var cmd string
+			if c.IsLocal() {
+				cmd = fmt.Sprintf(`cd %s ; `, c.localVMDir(node))
+			}
+			cmd += cockroachNodeBinary(c, node) + " sql --url " +
+				c.NodeURL("localhost", desc.Port, virtualClusterName, desc.ServiceMode) + " " +
+				ssh.Escape(args)
 
-		return c.runCmdOnSingleNode(ctx, l, node, cmd, defaultCmdOpts("run-sql"))
-	}, WithDisplay(display), WithWaitOnFail())
+			return c.runCmdOnSingleNode(ctx, l, node, cmd, defaultCmdOpts("run-sql"))
+		})
 
 	return results, err
 }
@@ -1063,8 +1071,10 @@ func (c *SyncedCluster) createAdminUserForSecureCluster(
 	// work for shared-process virtual clusters.
 	retryOpts := retry.Options{MaxRetries: 20}
 	if err := retryOpts.Do(ctx, func(ctx context.Context) error {
+		// We use the first node in the virtual cluster to create the user.
+		firstNode := c.TargetNodes()[0]
 		results, err := c.ExecSQL(
-			ctx, l, Nodes{startOpts.GetInitTarget()}, startOpts.VirtualClusterName, startOpts.SQLInstance, []string{
+			ctx, l, Nodes{firstNode}, startOpts.VirtualClusterName, startOpts.SQLInstance, []string{
 				"-e", stmts,
 			})
 

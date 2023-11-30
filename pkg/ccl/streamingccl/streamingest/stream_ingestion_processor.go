@@ -18,7 +18,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/ccl/streamingccl"
 	"github.com/cockroachdb/cockroach/pkg/ccl/streamingccl/replicationutils"
 	"github.com/cockroachdb/cockroach/pkg/ccl/streamingccl/streamclient"
-	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
@@ -319,7 +318,6 @@ func newStreamIngestionDataProcessor(
 		cutoverProvider: &cutoverFromJobProgress{
 			jobID: jobspb.JobID(spec.JobID),
 			db:    flowCtx.Cfg.DB,
-			cv:    flowCtx.Cfg.Settings.Version,
 		},
 		buffer:           &streamIngestionBuffer{},
 		cutoverCh:        make(chan struct{}),
@@ -876,7 +874,6 @@ func (sip *streamIngestionProcessor) bufferCheckpoint(event partitionEvent) erro
 
 	sip.metrics.EarliestDataCheckpointSpan.Update(lowestTimestamp.GoTime().UnixNano())
 	sip.metrics.LatestDataCheckpointSpan.Update(highestTimestamp.GoTime().UnixNano())
-	sip.metrics.DataCheckpointSpanCount.Update(int64(len(resolvedSpans)))
 	sip.metrics.ResolvedEvents.Inc(1)
 	return nil
 }
@@ -1255,11 +1252,10 @@ type cutoverProvider interface {
 type cutoverFromJobProgress struct {
 	db    isql.DB
 	jobID jobspb.JobID
-	cv    clusterversion.Handle
 }
 
 func (c *cutoverFromJobProgress) cutoverReached(ctx context.Context) (bool, error) {
-	ingestionProgress, err := replicationutils.LoadIngestionProgress(ctx, c.db, c.jobID, c.cv)
+	ingestionProgress, err := replicationutils.LoadIngestionProgress(ctx, c.db, c.jobID)
 	if err != nil {
 		return false, err
 	}

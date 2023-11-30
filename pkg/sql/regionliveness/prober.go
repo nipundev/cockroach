@@ -12,16 +12,20 @@ package regionliveness
 
 import (
 	"context"
+	"sort"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	clustersettings "github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlliveness/slinstance"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
@@ -37,6 +41,23 @@ var RegionLivenessEnabled = settings.RegisterBoolSetting(settings.ApplicationLev
 // and not quarantined due to expiration.
 type LiveRegions map[string]struct{}
 
+// ForEach does ordered iteration over the regions.
+func (l LiveRegions) ForEach(fn func(region string) error) error {
+	regions := make([]string, 0, len(l))
+	for r := range l {
+		regions = append(regions, r)
+	}
+	sort.Slice(regions, func(a, b int) bool {
+		return regions[a] < regions[b]
+	})
+	for _, r := range regions {
+		if err := fn(r); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // Prober used to determine the set of regions which are still alive.
 type Prober interface {
 	// ProbeLiveness can be used after a timeout to label a regions as unavailable.
@@ -44,6 +65,9 @@ type Prober interface {
 	// QueryLiveness can be used to get the list of regions which are currently
 	// accessible.
 	QueryLiveness(ctx context.Context, txn *kv.Txn) (LiveRegions, error)
+	// GetTableTimeout gets maximum timeout waiting on a table before issuing
+	//// liveness queries.
+	GetTableTimeout() (bool, time.Duration)
 }
 
 // RegionProvider abstracts the lookup of regions (see regions.Provider).
@@ -53,22 +77,35 @@ type RegionProvider interface {
 	GetRegions(ctx context.Context) (*serverpb.RegionsResponse, error)
 }
 
-type RegionProviderFactory func(txn *kv.Txn) RegionProvider
+type CachedDatabaseRegions interface {
+	IsMultiRegion() bool
+	GetRegionEnumTypeDesc() catalog.RegionEnumTypeDescriptor
+}
 
 type livenessProber struct {
-	db                    isql.DB
-	regionProviderFactory RegionProviderFactory
-	settings              *clustersettings.Settings
+	db              isql.DB
+	cachedDBRegions CachedDatabaseRegions
+	settings        *clustersettings.Settings
+}
+
+var probeLivenessTimeout = 15 * time.Second
+
+func TestingSetProbeLivenessTimeout(newTimeout time.Duration) func() {
+	oldTimeout := probeLivenessTimeout
+	probeLivenessTimeout = newTimeout
+	return func() {
+		probeLivenessTimeout = oldTimeout
+	}
 }
 
 // NewLivenessProber creates a new region liveness prober.
 func NewLivenessProber(
-	db isql.DB, regionProviderFactory RegionProviderFactory, settings *clustersettings.Settings,
+	db isql.DB, cachedDBRegions CachedDatabaseRegions, settings *clustersettings.Settings,
 ) Prober {
 	return &livenessProber{
-		db:                    db,
-		regionProviderFactory: regionProviderFactory,
-		settings:              settings,
+		db:              db,
+		cachedDBRegions: cachedDBRegions,
+		settings:        settings,
 	}
 }
 
@@ -79,19 +116,24 @@ func (l *livenessProber) ProbeLiveness(ctx context.Context, region string) error
 		return nil
 	}
 	const probeQuery = `
-SELECT * FROM system.sql_instances WHERE crdb_region=$1::system.crdb_internal_region
+SELECT count(*) FROM system.sql_instances WHERE crdb_region = $1::system.crdb_internal_region
 `
-	err := timeutil.RunWithTimeout(ctx, "probe-liveness", time.Second*15,
+	err := timeutil.RunWithTimeout(ctx, "probe-liveness", probeLivenessTimeout,
 		func(ctx context.Context) error {
 			return l.db.Txn(ctx, func(ctx context.Context, txn isql.Txn) error {
-				_, err := txn.Exec(ctx, "probe-sql-instance", txn.KV(), probeQuery, region)
-				return err
+				_, err := txn.QueryRowEx(
+					ctx, "probe-sql-instance", txn.KV(), sessiondata.NodeUserSessionDataOverride,
+					probeQuery, region,
+				)
+				if err != nil {
+					return err
+				}
+				return nil
 			})
 		})
 
 	// Region is alive or we hit some other error.
-	if err == nil ||
-		!IsQueryTimeoutErr(err) {
+	if err == nil || !IsQueryTimeoutErr(err) {
 		return err
 	}
 
@@ -102,6 +144,16 @@ SELECT * FROM system.sql_instances WHERE crdb_region=$1::system.crdb_internal_re
 		// Get the read timestamp and pick a commit deadline.
 		readTS := txn.KV().ReadTimestamp().AddDuration(defaultHeartbeat)
 		txnTS := readTS.AddDuration(defaultTTL)
+		// Confirm that unavailable_at is not already set.
+		rows, err := txn.QueryRow(ctx, "check-region-unavailable-exists", txn.KV(),
+			"SELECT unavailable_at FROM system.region_liveness WHERE unavailable_at IS NOT NULL AND crdb_region=$1",
+			region)
+		// If there is any row from this query then unavailable_at is already set,
+		// so don't push it further.
+		if err != nil || len(rows) == 1 {
+			return err
+		}
+		// Upset a new unavailable_at time.
 		_, err = txn.Exec(ctx, "mark-region-unavailable", txn.KV(),
 			"UPSERT into system.region_liveness(crdb_region, unavailable_at) VALUES ($1, $2)",
 			region,
@@ -116,47 +168,63 @@ SELECT * FROM system.sql_instances WHERE crdb_region=$1::system.crdb_internal_re
 		}
 		return txn.KV().UpdateDeadline(ctx, readTS)
 	})
+
 }
 
 // QueryLiveness implements Prober.
 func (l *livenessProber) QueryLiveness(ctx context.Context, txn *kv.Txn) (LiveRegions, error) {
-	regionStatus := make(LiveRegions)
 	executor := l.db.Executor()
-	regionProvider := l.regionProviderFactory(txn)
-	regions, err := regionProvider.GetRegions(ctx)
-	if err != nil {
+	// Database is not multi-region so report a single region.
+	if l.cachedDBRegions == nil ||
+		!l.cachedDBRegions.IsMultiRegion() {
+		return nil, nil
+	}
+	regionStatus := make(LiveRegions)
+	if err := l.cachedDBRegions.GetRegionEnumTypeDesc().ForEachPublicRegion(func(regionName catpb.RegionName) error {
+		regionStatus[string(regionName)] = struct{}{}
+		return nil
+	}); err != nil {
 		return nil, err
 	}
-	// Add entries for regions
-	for region := range regions.Regions {
-		regionStatus[region] = struct{}{}
-	}
-
 	// If region liveness is disabled, return nil.
 	if !RegionLivenessEnabled.Get(&l.settings.SV) {
 		return regionStatus, nil
 	}
 	// Detect and down regions and remove them.
-	rows, err := executor.QueryBuffered(ctx, "query-region-liveness", txn,
-		"SELECT * FROM system.region_liveness")
+	rows, err := executor.QueryBufferedEx(
+		ctx, "query-region-liveness", txn, sessiondata.NodeUserSessionDataOverride,
+		"SELECT crdb_region, unavailable_at FROM system.region_liveness",
+	)
 	if err != nil {
 		return nil, err
 	}
 	for _, row := range rows {
 		enum, _ := tree.AsDEnum(row[0])
-		timestamp := tree.MustBeDTimestamp(row[1])
+		unavailableAt := tree.MustBeDTimestamp(row[1])
 		// Region is now officially unavailable, so lets remove
 		// it.
-		if txn.ReadTimestamp().GoTime().After(timestamp.Time) {
+		if txn.ReadTimestamp().GoTime().After(unavailableAt.Time) {
 			delete(regionStatus, enum.LogicalRep)
 		}
 	}
 	return regionStatus, nil
 }
 
+// GetTableTimeout gets maximum timeout waiting on a table before issuing
+// liveness queries.
+func (l *livenessProber) GetTableTimeout() (bool, time.Duration) {
+	return RegionLivenessEnabled.Get(&l.settings.SV), probeLivenessTimeout
+}
+
 // IsQueryTimeoutErr determines if a query timeout error was hit, specifically
 // when checking for region liveness.
 func IsQueryTimeoutErr(err error) bool {
 	return pgerror.GetPGCode(err) == pgcode.QueryCanceled ||
-		errors.Is(err, &timeutil.TimeoutError{})
+		errors.HasType(err, (*timeutil.TimeoutError)(nil))
+}
+
+// IsMissingRegionEnumErr determines if a query hit an error because of a missing
+// because of the region enum.
+func IsMissingRegionEnumErr(err error) bool {
+	return pgerror.GetPGCode(err) == pgcode.InvalidTextRepresentation
 }

@@ -83,9 +83,11 @@ const (
 
 	// ALTER DATABASE ...
 
-	alterDatabaseAddRegion     // ALTER DATABASE <db> ADD REGION <region>
-	alterDatabasePrimaryRegion //  ALTER DATABASE <db> PRIMARY REGION <region>
-	alterDatabaseSurvivalGoal  // ALTER DATABASE <db> SURVIVE <failure_mode>
+	alterDatabaseAddRegion       // ALTER DATABASE <db> ADD REGION <region>
+	alterDatabasePrimaryRegion   // ALTER DATABASE <db> PRIMARY REGION <region>
+	alterDatabaseSurvivalGoal    // ALTER DATABASE <db> SURVIVE <failure_mode>
+	alterDatabaseAddSuperRegion  // ALTER DATABASE <db> ADD SUPER REGION <region> VALUES ...
+	alterDatabaseDropSuperRegion // ALTER DATABASE <db> DROP SUPER REGION <region>
 
 	// ALTER TABLE <table> ...
 
@@ -94,10 +96,11 @@ const (
 	alterTableAddConstraintForeignKey // ALTER TABLE <table> ADD CONSTRAINT <constraint> FOREIGN KEY (<column>) REFERENCES <table> (<column>)
 	alterTableAddConstraintUnique     // ALTER TABLE <table> ADD CONSTRAINT <constraint> UNIQUE (<column>)
 	alterTableAlterColumnType         // ALTER TABLE <table> ALTER [COLUMN] <column> [SET DATA] TYPE <type>
+	alterTableAlterPrimaryKey         // ALTER TABLE <table> ALTER PRIMARY KEY USING COLUMNS (<columns>)
 	alterTableDropColumn              // ALTER TABLE <table> DROP COLUMN <column>
+	alterTableDropColumnDefault       // ALTER TABLE <table> ALTER [COLUMN] <column> DROP DEFAULT
 	alterTableDropConstraint          // ALTER TABLE <table> DROP CONSTRAINT <constraint>
 	alterTableDropNotNull             // ALTER TABLE <table> ALTER [COLUMN] <column> DROP NOT NULL
-	alterTableDropColumnDefault       // ALTER TABLE <table> ALTER [COLUMN] <column> DROP DEFAULT
 	alterTableDropStored              // ALTER TABLE <table> ALTER [COLUMN] <column> DROP STORED
 	alterTableLocality                // ALTER TABLE <table> LOCALITY <locality>
 	alterTableRenameColumn            // ALTER TABLE <table> RENAME [COLUMN] <column> TO <column>
@@ -127,14 +130,8 @@ const (
 	dropView     // DROP VIEW <view>
 
 	// Unimplemented operations. TODO(sql-foundations): Audit and/or implement these operations.
-	// alterDatabaseAddSuperRegion
-	// alterDatabaseAlterSuperRegion
-	// alterDatabaseDropRegion
-	// alterDatabaseDropSecondaryRegion
-	// alterDatabaseDropSuperRegion
 	// alterDatabaseOwner
 	// alterDatabasePlacement
-	// alterDatabaseSecondaryRegion
 	// alterDatabaseSetZoneConfigExtension
 	// alterDefaultPrivileges
 	// alterFunctionDepExtension
@@ -151,7 +148,6 @@ const (
 	// alterSchemaOwner
 	// alterSchemaRename
 	// alterSequence
-	// alterTableAlterPrimaryKey
 	// alterTableInjectStats
 	// alterTableOwner
 	// alterTablePartitionByTable
@@ -211,11 +207,14 @@ var opFuncs = []func(*operationGenerator, context.Context, pgx.Tx) (*opStmt, err
 	alterDatabaseAddRegion:            (*operationGenerator).addRegion,
 	alterDatabasePrimaryRegion:        (*operationGenerator).primaryRegion,
 	alterDatabaseSurvivalGoal:         (*operationGenerator).survive,
+	alterDatabaseAddSuperRegion:       (*operationGenerator).alterDatabaseAddSuperRegion,
+	alterDatabaseDropSuperRegion:      (*operationGenerator).alterDatabaseDropSuperRegion,
 	alterTableAddColumn:               (*operationGenerator).addColumn,
 	alterTableAddConstraint:           (*operationGenerator).addConstraint,
 	alterTableAddConstraintForeignKey: (*operationGenerator).addForeignKeyConstraint,
 	alterTableAddConstraintUnique:     (*operationGenerator).addUniqueConstraint,
 	alterTableAlterColumnType:         (*operationGenerator).setColumnType,
+	alterTableAlterPrimaryKey:         (*operationGenerator).alterTableAlterPrimaryKey,
 	alterTableDropColumn:              (*operationGenerator).dropColumn,
 	alterTableDropColumnDefault:       (*operationGenerator).dropColumnDefault,
 	alterTableDropConstraint:          (*operationGenerator).dropConstraint,
@@ -255,6 +254,10 @@ var opWeights = []int{
 	alterTableDropConstraint:          0, // TODO(spaskob): unimplemented
 	alterTableAddConstraintForeignKey: 0, // Disabled and tracked with #91195
 	alterDatabaseAddRegion:            1,
+	alterDatabaseAddSuperRegion:       0, // Disabled and tracked with #111299
+	alterDatabaseDropSuperRegion:      0, // Disabled and tracked with #111299
+	alterDatabasePrimaryRegion:        0, // Disabled and tracked with #83831
+	alterDatabaseSurvivalGoal:         0, // Disabled and tracked with #83831
 	alterTableAddConstraintUnique:     0,
 	alterTableLocality:                1,
 	createIndex:                       1,
@@ -274,7 +277,6 @@ var opWeights = []int{
 	dropView:                          1,
 	alterTypeDropValue:                1,
 	dropSchema:                        1,
-	alterDatabasePrimaryRegion:        0, // Disabled and tracked with #83831
 	alterTableRenameColumn:            1,
 	renameIndex:                       1,
 	renameSequence:                    1,
@@ -282,8 +284,8 @@ var opWeights = []int{
 	renameView:                        1,
 	alterTableSetColumnDefault:        1,
 	alterTableSetColumnNotNull:        1,
+	alterTableAlterPrimaryKey:         1,
 	alterTableAlterColumnType:         0, // Disabled and tracked with #66662.
-	alterDatabaseSurvivalGoal:         0, // Disabled and tracked with #83831
 }
 
 // This workload will maintain its own list of minimal supported versions for

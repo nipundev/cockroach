@@ -1194,7 +1194,8 @@ func (s *statusServer) GetFiles(
 		return status.GetFiles(ctx, req)
 	}
 
-	return getLocalFiles(req, s.sqlServer.cfg.HeapProfileDirName, s.sqlServer.cfg.GoroutineDumpDirName)
+	return getLocalFiles(req, s.sqlServer.cfg.HeapProfileDirName, s.sqlServer.cfg.GoroutineDumpDirName,
+		os.Stat, os.ReadFile)
 }
 
 // checkFilePattern checks if a pattern is acceptable for the GetFiles call.
@@ -1315,6 +1316,12 @@ func (s *statusServer) LogFile(
 		if err := decoder.Decode(&entry); err != nil {
 			if err == io.EOF {
 				break
+			}
+			if errors.Is(err, log.ErrMalformedLogEntry) {
+				resp.ParseErrors = append(resp.ParseErrors, err.Error())
+				// Proceed decoding next entry, as we want to retrieve as much logs
+				// as possible.
+				continue
 			}
 			return nil, srverrors.ServerError(ctx, err)
 		}
@@ -3944,7 +3951,7 @@ func (s *statusServer) GetJobProfilerExecutionDetails(
 	execCfg := s.sqlServer.execCfg
 	var data []byte
 	if err := execCfg.InternalDB.Txn(ctx, func(ctx context.Context, txn isql.Txn) error {
-		data, err = jobs.ReadExecutionDetailFile(ctx, req.Filename, txn, jobID, execCfg.Settings.Version)
+		data, err = jobs.ReadExecutionDetailFile(ctx, req.Filename, txn, jobID)
 		return err
 	}); err != nil {
 		return nil, err
@@ -3965,7 +3972,7 @@ func (s *statusServer) ListJobProfilerExecutionDetails(
 
 	jobID := jobspb.JobID(req.JobId)
 	execCfg := s.sqlServer.execCfg
-	files, err := jobs.ListExecutionDetailFiles(ctx, execCfg.InternalDB, jobID, execCfg.Settings.Version)
+	files, err := jobs.ListExecutionDetailFiles(ctx, execCfg.InternalDB, jobID)
 	if err != nil {
 		return nil, err
 	}

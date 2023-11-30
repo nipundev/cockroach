@@ -24,7 +24,6 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/build"
-	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
@@ -34,7 +33,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvcoord"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/lock"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvflowcontrol/kvflowinspectpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness/livenesspb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/protectedts/ptpb"
@@ -221,6 +219,7 @@ var crdbInternal = virtualSchema{
 		catconstants.CrdbInternalKVFlowTokenDeductions:              crdbInternalKVFlowTokenDeductions,
 		catconstants.CrdbInternalRepairableCatalogCorruptionsViewID: crdbInternalRepairableCatalogCorruptions,
 		catconstants.CrdbInternalKVProtectedTS:                      crdbInternalKVProtectedTSTable,
+		catconstants.CrdbInternalKVSessionBasedLeases:               crdbInternalSessionBasedLeases,
 	},
 	validWithNoDatabaseContext: true,
 }
@@ -945,25 +944,6 @@ WITH
 	LEFT JOIN latestprogress AS progress ON j.id = progress.job_id
 `
 
-	// Before clusterversion.TODO_Delete_V23_1JobInfoTableIsBackfilled, the system.job_info
-	// table has not been fully populated with the payload and progress of jobs in
-	// the cluster.
-	systemJobsBaseQuery = `
-		SELECT
-			id, status, created, payload, progress, created_by_type, created_by_id,
-			claim_session_id, claim_instance_id, num_runs, last_run, job_type
-		FROM system.jobs`
-
-	// TODO(jayant): remove the version gate in 24.1
-	// Before clusterversion.TODO_Delete_V23_1BackfillTypeColumnInJobsTable, the system.jobs table did not have
-	// a fully populated job_type column, so we must project it manually
-	// with crdb_internal.job_payload_type.
-	oldSystemJobsBaseQuery = `
-		SELECT id, status, created, payload, progress, created_by_type, created_by_id,
-			claim_session_id, claim_instance_id, num_runs, last_run,
-			crdb_internal.job_payload_type(payload) as job_type
-		FROM system.jobs`
-
 	systemJobsIDPredicate     = ` WHERE id = $1`
 	systemJobsTypePredicate   = ` WHERE job_type = $1`
 	systemJobsStatusPredicate = ` WHERE status = $1`
@@ -978,30 +958,16 @@ const (
 	jobStatus
 )
 
-func getInternalSystemJobsQueryFromClusterVersion(
-	ctx context.Context, version clusterversion.Handle, predicate systemJobsPredicate,
-) string {
-	var baseQuery string
-	if version.IsActive(ctx, clusterversion.TODO_Delete_V23_1JobInfoTableIsBackfilled) {
-		baseQuery = SystemJobsAndJobInfoBaseQuery
-		if predicate == jobID {
-			baseQuery = systemJobsAndJobInfoBaseQueryWithIDPredicate
-		}
-	} else if version.IsActive(ctx, clusterversion.TODO_Delete_V23_1BackfillTypeColumnInJobsTable) {
-		baseQuery = systemJobsBaseQuery
-	} else {
-		baseQuery = oldSystemJobsBaseQuery
-	}
-
+func getInternalSystemJobsQuery(predicate systemJobsPredicate) string {
 	switch predicate {
 	case noPredicate:
-		return baseQuery
+		return SystemJobsAndJobInfoBaseQuery
 	case jobID:
-		return baseQuery + systemJobsIDPredicate
+		return systemJobsAndJobInfoBaseQueryWithIDPredicate + systemJobsIDPredicate
 	case jobType:
-		return baseQuery + systemJobsTypePredicate
+		return SystemJobsAndJobInfoBaseQuery + systemJobsTypePredicate
 	case jobStatus:
-		return baseQuery + systemJobsStatusPredicate
+		return SystemJobsAndJobInfoBaseQuery + systemJobsStatusPredicate
 	}
 
 	return ""
@@ -1031,28 +997,28 @@ CREATE TABLE crdb_internal.system_jobs (
 	indexes: []virtualIndex{
 		{
 			populate: func(ctx context.Context, unwrappedConstraint tree.Datum, p *planner, _ catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) (matched bool, err error) {
-				q := getInternalSystemJobsQueryFromClusterVersion(ctx, p.execCfg.Settings.Version, jobID)
+				q := getInternalSystemJobsQuery(jobID)
 				targetType := tree.MustBeDInt(unwrappedConstraint)
 				return populateSystemJobsTableRows(ctx, p, addRow, q, targetType)
 			},
 		},
 		{
 			populate: func(ctx context.Context, unwrappedConstraint tree.Datum, p *planner, _ catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) (matched bool, err error) {
-				q := getInternalSystemJobsQueryFromClusterVersion(ctx, p.execCfg.Settings.Version, jobType)
+				q := getInternalSystemJobsQuery(jobType)
 				targetType := tree.MustBeDString(unwrappedConstraint)
 				return populateSystemJobsTableRows(ctx, p, addRow, q, targetType)
 			},
 		},
 		{
 			populate: func(ctx context.Context, unwrappedConstraint tree.Datum, p *planner, _ catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) (matched bool, err error) {
-				q := getInternalSystemJobsQueryFromClusterVersion(ctx, p.execCfg.Settings.Version, jobStatus)
+				q := getInternalSystemJobsQuery(jobStatus)
 				targetType := tree.MustBeDString(unwrappedConstraint)
 				return populateSystemJobsTableRows(ctx, p, addRow, q, targetType)
 			},
 		},
 	},
 	populate: func(ctx context.Context, p *planner, db catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
-		_, err := populateSystemJobsTableRows(ctx, p, addRow, getInternalSystemJobsQueryFromClusterVersion(ctx, p.execCfg.Settings.Version, noPredicate))
+		_, err := populateSystemJobsTableRows(ctx, p, addRow, getInternalSystemJobsQuery(noPredicate))
 		return err
 	},
 }
@@ -1081,7 +1047,7 @@ func populateSystemJobsTableRows(
 		params...,
 	)
 	if err != nil {
-		return matched, jobs.MaybeGenerateForcedRetryableError(ctx, p.Txn(), err, p.execCfg.Settings.Version)
+		return matched, err
 	}
 
 	cleanup := func(ctx context.Context) {
@@ -1094,7 +1060,7 @@ func populateSystemJobsTableRows(
 	for {
 		hasNext, err := it.Next(ctx)
 		if !hasNext || err != nil {
-			return matched, jobs.MaybeGenerateForcedRetryableError(ctx, p.Txn(), err, p.execCfg.Settings.Version)
+			return matched, err
 		}
 
 		currentRow := it.Cur()
@@ -1133,21 +1099,13 @@ const (
 	// Note that we are querying crdb_internal.system_jobs instead of system.jobs directly.
 	// The former has access control built in and will filter out jobs that the
 	// user is not allowed to see.
-	jobsQFrom         = ` FROM crdb_internal.system_jobs`
-	jobsBackoffArgs   = `(SELECT $1::FLOAT AS initial_delay, $2::FLOAT AS max_delay) args`
-	jobsStatusFilter  = ` WHERE status = $3`
-	oldJobsTypeFilter = ` WHERE crdb_internal.job_payload_type(payload) = $3`
-	jobsTypeFilter    = ` WHERE job_type = $3`
-	jobsQuery         = jobsQSelect + `, last_run::timestamptz, COALESCE(num_runs, 0), ` + jobs.NextRunClause +
+	jobsQFrom        = ` FROM crdb_internal.system_jobs`
+	jobsBackoffArgs  = `(SELECT $1::FLOAT AS initial_delay, $2::FLOAT AS max_delay) args`
+	jobsStatusFilter = ` WHERE status = $3`
+	jobsTypeFilter   = ` WHERE job_type = $3`
+	jobsQuery        = jobsQSelect + `, last_run::timestamptz, COALESCE(num_runs, 0), ` + jobs.NextRunClause +
 		` as next_run` + jobsQFrom + ", " + jobsBackoffArgs
 )
-
-func getCRDBInternalJobsTableTypeFilter(ctx context.Context, version clusterversion.Handle) string {
-	if !version.IsActive(ctx, clusterversion.TODO_Delete_V23_1BackfillTypeColumnInJobsTable) {
-		return oldJobsTypeFilter
-	}
-	return jobsTypeFilter
-}
 
 // TODO(tbg): prefix with kv_.
 var crdbInternalJobsTable = virtualSchemaTable{
@@ -1187,7 +1145,7 @@ CREATE TABLE crdb_internal.jobs (
 		},
 	}, {
 		populate: func(ctx context.Context, unwrappedConstraint tree.Datum, p *planner, _ catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) (matched bool, err error) {
-			q := jobsQuery + getCRDBInternalJobsTableTypeFilter(ctx, p.execCfg.Settings.Version)
+			q := jobsQuery + jobsTypeFilter
 			targetStatus := tree.MustBeDString(unwrappedConstraint)
 			return makeJobsTableRows(ctx, p, addRow, q, p.execCfg.JobRegistry.RetryInitialDelay(), p.execCfg.JobRegistry.RetryMaxDelay(), targetStatus)
 		},
@@ -1592,6 +1550,37 @@ CREATE TABLE crdb_internal.kv_protected_ts_records (
 			}
 
 		}
+	},
+}
+
+var crdbInternalSessionBasedLeases = virtualSchemaTable{
+	schema: `
+CREATE TABLE crdb_internal.kv_session_based_leases (
+  desc_id         INT8,
+  version         INT8,
+  sql_instance_id INT8,
+  session_id      BYTES NOT NULL,
+  crdb_region     BYTES NOT NULL
+);
+`,
+	comment: `reads from the internal session based leases table (before the table format is converted)`,
+	populate: func(ctx context.Context, p *planner, db catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) (err error) {
+		return p.InternalSQLTxn().WithSyntheticDescriptors(catalog.Descriptors{systemschema.LeaseTable_V24_1()},
+			func() error {
+				rows, err := p.InternalSQLTxn().QueryBuffered(
+					ctx, "query-leases", p.Txn(),
+					"SELECT desc_id, version, sql_instance_id, session_id, crdb_region FROM system.lease",
+				)
+				if err != nil {
+					return err
+				}
+				for _, d := range rows {
+					if err := addRow(d...); err != nil {
+						return err
+					}
+				}
+				return nil
+			})
 	},
 }
 
@@ -5823,7 +5812,7 @@ var crdbInternalCatalogCommentsTable = virtualSchemaTable{
 		ctx context.Context, p *planner, dbContext catalog.DatabaseDescriptor, addRow func(...tree.Datum) error,
 	) error {
 		h := makeOidHasher()
-		all, err := p.Descriptors().GetAllComments(ctx, p.Txn())
+		all, err := p.Descriptors().GetAllComments(ctx, p.Txn(), dbContext)
 		if err != nil {
 			return err
 		}
@@ -7940,6 +7929,8 @@ func genClusterLocksGenerator(
 		}
 
 		var curLock *roachpb.LockStateInfo
+		// Used to deduplicate waiter information from shared locks.
+		var prevLock *roachpb.LockStateInfo
 		var fErr error
 		waiterIdx := -1
 		// Flatten response such that both lock holders and lock waiters are each
@@ -7948,8 +7939,14 @@ func genClusterLocksGenerator(
 		// each waiter, prior to moving onto the next lock (or fetching additional
 		// results as necessary).
 		return func() (tree.Datums, error) {
+			lockHasWaitersDeduped := false
 			if curLock == nil || waiterIdx >= len(curLock.Waiters) {
+				prevLock = curLock
 				curLock, fErr = getNextLock()
+				if prevLock != nil && curLock != nil && prevLock.Key.Equal(curLock.Key) {
+					lockHasWaitersDeduped = len(curLock.Waiters) > 0
+					curLock.Waiters = curLock.Waiters[:0]
+				}
 				waiterIdx = -1
 			}
 
@@ -7958,10 +7955,10 @@ func genClusterLocksGenerator(
 			if curLock == nil || fErr != nil {
 				return nil, fErr
 			}
-
-			strengthDatum := tree.DNull
 			txnIDDatum := tree.DNull
 			tsDatum := tree.DNull
+			isolationLevelDatum := tree.DNull
+			strengthDatum := tree.DNull
 			durationDatum := tree.DNull
 			granted := false
 			// Utilize -1 to indicate that the row represents the lock holder.
@@ -7969,7 +7966,8 @@ func genClusterLocksGenerator(
 				if curLock.LockHolder != nil {
 					txnIDDatum = tree.NewDUuid(tree.DUuid{UUID: curLock.LockHolder.ID})
 					tsDatum = eval.TimestampToInexactDTimestamp(curLock.LockHolder.WriteTimestamp)
-					strengthDatum = tree.NewDString(lock.Exclusive.String())
+					isolationLevelDatum = tree.NewDString(tree.IsolationLevelFromKVTxnIsolationLevel(curLock.LockHolder.IsoLevel).String())
+					strengthDatum = tree.NewDString(curLock.LockStrength.String())
 					durationDatum = tree.NewDInterval(
 						duration.MakeDuration(curLock.HoldDuration.Nanoseconds(), 0 /* days */, 0 /* months */),
 						types.DefaultIntervalTypeMetadata,
@@ -7981,6 +7979,7 @@ func genClusterLocksGenerator(
 				if waiter.WaitingTxn != nil {
 					txnIDDatum = tree.NewDUuid(tree.DUuid{UUID: waiter.WaitingTxn.ID})
 					tsDatum = eval.TimestampToInexactDTimestamp(waiter.WaitingTxn.WriteTimestamp)
+					isolationLevelDatum = tree.NewDString(tree.IsolationLevelFromKVTxnIsolationLevel(waiter.WaitingTxn.IsoLevel).String())
 				}
 				strengthDatum = tree.NewDString(waiter.Strength.String())
 				durationDatum = tree.NewDInterval(
@@ -8002,7 +8001,7 @@ func genClusterLocksGenerator(
 				keyOrRedacted, _, _ = keys.DecodeTenantPrefix(curLock.Key)
 				prettyKeyOrRedacted = keys.PrettyPrint(nil /* valDirs */, keyOrRedacted)
 			}
-
+			contented := lockHasWaitersDeduped || len(curLock.Waiters) > 0
 			return tree.Datums{
 				tree.NewDInt(tree.DInt(curLock.RangeID)),     /* range_id */
 				tree.NewDInt(tree.DInt(tableID)),             /* table_id */
@@ -8017,9 +8016,9 @@ func genClusterLocksGenerator(
 				strengthDatum,                                /* lock_strength */
 				tree.NewDString(curLock.Durability.String()), /* durability */
 				tree.MakeDBool(tree.DBool(granted)),          /* granted */
-				tree.MakeDBool(len(curLock.Waiters) > 0),     /* contended */
+				tree.MakeDBool(tree.DBool(contented)),        /* contended */
 				durationDatum,                                /* duration */
-				tree.NewDString(tree.IsolationLevelFromKVTxnIsolationLevel(curLock.LockHolder.IsoLevel).String()), /* isolation_level */
+				isolationLevelDatum,                          /* isolation_level */
 			}, nil
 
 		}, nil, nil

@@ -493,7 +493,7 @@ func bootstrapCluster(
 				Codec:                   keys.SystemSQLCodec,
 			}
 			for _, v := range bootstrap.VersionsWithInitialValues() {
-				if initCfg.latestVersion == clusterversion.ByKey(v) {
+				if initCfg.latestVersion == v.Version() {
 					initialValuesOpts.OverrideKey = v
 					break
 				}
@@ -753,7 +753,7 @@ func (n *Node) start(
 	allEngines = append(allEngines, state.uninitializedEngines...)
 	for _, e := range allEngines {
 		t := e.Type()
-		log.Infof(ctx, "started with engine type %v", t)
+		log.Infof(ctx, "started with engine type %v", &t)
 	}
 	log.Infof(ctx, "started with attributes %v", attrs.Attrs)
 	return nil
@@ -1366,7 +1366,10 @@ func (n *Node) batchInternal(
 	// replica to notice the cancellation and return a response. For this reason,
 	// we log the server-side trace of the cancelled request to help debug what
 	// the request was doing at the time it noticed the cancellation.
-	if pErr != nil && ctx.Err() != nil {
+	//
+	// To avoid log spam for now we only log the trace if the request was an
+	// ExportRequest.
+	if pErr != nil && ctx.Err() != nil && args.IsSingleExportRequest() {
 		if sp := tracing.SpanFromContext(ctx); sp != nil && !sp.IsNoop() {
 			recording := sp.GetConfiguredRecording()
 			if recording.Len() != 0 {
@@ -1987,6 +1990,7 @@ func (n *Node) ResetQuorum(
 	// replicas from this fresh snapshot.
 	if err := kvserver.SendEmptySnapshot(
 		ctx,
+		n.clusterID.Get(),
 		n.storeCfg.Settings,
 		n.storeCfg.Tracer(),
 		conn,

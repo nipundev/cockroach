@@ -3267,6 +3267,7 @@ Support status: [reserved](#support-status)
 | Field | Type | Label | Description | Support status |
 | ----- | ---- | ----- | ----------- | -------------- |
 | entries | [cockroach.util.log.Entry](#cockroach.server.serverpb.LogEntriesResponse-cockroach.util.log.Entry) | repeated |  | [reserved](#support-status) |
+| parse_errors | [string](#cockroach.server.serverpb.LogEntriesResponse-string) | repeated | parse_errors contains list of errors that occurred during retrieving individual log entries that don't prevent to return at least partial response. | [reserved](#support-status) |
 
 
 
@@ -3317,6 +3318,7 @@ Support status: [reserved](#support-status)
 | Field | Type | Label | Description | Support status |
 | ----- | ---- | ----- | ----------- | -------------- |
 | entries | [cockroach.util.log.Entry](#cockroach.server.serverpb.LogEntriesResponse-cockroach.util.log.Entry) | repeated |  | [reserved](#support-status) |
+| parse_errors | [string](#cockroach.server.serverpb.LogEntriesResponse-string) | repeated | parse_errors contains list of errors that occurred during retrieving individual log entries that don't prevent to return at least partial response. | [reserved](#support-status) |
 
 
 
@@ -3400,6 +3402,65 @@ Support status: [reserved](#support-status)
 | raft_log_too_large_range_ids | [int64](#cockroach.server.serverpb.ProblemRangesResponse-int64) | repeated |  | [reserved](#support-status) |
 | circuit_breaker_error_range_ids | [int64](#cockroach.server.serverpb.ProblemRangesResponse-int64) | repeated |  | [reserved](#support-status) |
 | paused_replica_ids | [int64](#cockroach.server.serverpb.ProblemRangesResponse-int64) | repeated |  | [reserved](#support-status) |
+
+
+
+
+
+
+## DownloadSpan
+
+`GET /_status/downloadspans`
+
+
+
+Support status: [reserved](#support-status)
+
+#### Request Parameters
+
+
+
+
+
+
+
+| Field | Type | Label | Description | Support status |
+| ----- | ---- | ----- | ----------- | -------------- |
+| node_id | [string](#cockroach.server.serverpb.DownloadSpanRequest-string) |  |  | [reserved](#support-status) |
+| span | [cockroach.roachpb.Span](#cockroach.server.serverpb.DownloadSpanRequest-cockroach.roachpb.Span) |  |  | [reserved](#support-status) |
+
+
+
+
+
+
+
+#### Response Parameters
+
+
+
+
+
+
+
+| Field | Type | Label | Description | Support status |
+| ----- | ---- | ----- | ----------- | -------------- |
+| errors_by_node_id | [DownloadSpanResponse.ErrorsByNodeIdEntry](#cockroach.server.serverpb.DownloadSpanResponse-cockroach.server.serverpb.DownloadSpanResponse.ErrorsByNodeIdEntry) | repeated | ErrorsByNodeID contains any errors that occurred during fan-out calls to other nodes. | [reserved](#support-status) |
+
+
+
+
+
+
+<a name="cockroach.server.serverpb.DownloadSpanResponse-cockroach.server.serverpb.DownloadSpanResponse.ErrorsByNodeIdEntry"></a>
+#### DownloadSpanResponse.ErrorsByNodeIdEntry
+
+
+
+| Field | Type | Label | Description | Support status |
+| ----- | ---- | ----- | ----------- | -------------- |
+| key | [int32](#cockroach.server.serverpb.DownloadSpanResponse-int32) |  |  |  |
+| value | [string](#cockroach.server.serverpb.DownloadSpanResponse-string) |  |  |  |
 
 
 

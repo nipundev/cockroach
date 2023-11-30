@@ -408,6 +408,8 @@ func NewServer(cfg Config, stopper *stop.Stopper) (serverctl.ServerStartupInterf
 	kvNodeDialer := nodedialer.NewWithOpt(rpcContext, gossip.AddressResolver(g),
 		nodedialer.DialerOpt{TestingKnobs: dialerKnobs})
 
+	livenessCache := liveness.NewCache(g, clock, cfg.Settings, kvNodeDialer)
+
 	runtimeSampler := status.NewRuntimeStatSampler(ctx, clock.WallClock())
 	sysRegistry.AddMetricStruct(runtimeSampler)
 	// Save a reference to this sampler for use by additional servers
@@ -456,6 +458,9 @@ func NewServer(cfg Config, stopper *stop.Stopper) (serverctl.ServerStartupInterf
 		FirstRangeProvider: g,
 		Locality:           cfg.Locality,
 		TestingKnobs:       clientTestingKnobs,
+		HealthFunc: func(id roachpb.NodeID) bool {
+			return livenessCache.GetNodeVitality(id).IsLive(livenesspb.DistSender)
+		},
 	}
 	distSender := kvcoord.NewDistSender(distSenderCfg)
 	appRegistry.AddMetricStruct(distSender.Metrics())
@@ -505,10 +510,8 @@ func NewServer(cfg Config, stopper *stop.Stopper) (serverctl.ServerStartupInterf
 		Stopper:                 stopper,
 		Clock:                   clock,
 		Storage:                 liveness.NewKVStorage(db),
-		Gossip:                  g,
 		LivenessThreshold:       nlActive,
 		RenewalDuration:         nlRenewal,
-		Settings:                st,
 		HistogramWindowInterval: cfg.HistogramWindowInterval(),
 		// When we learn that a node is decommissioning, we want to proactively
 		// enqueue the ranges we have that also have a replica on the
@@ -535,20 +538,10 @@ func NewServer(cfg Config, stopper *stop.Stopper) (serverctl.ServerStartupInterf
 				log.Ops.Warningf(ctx, "writing last up timestamp: %v", err)
 			}
 		},
-		NodeDialer: kvNodeDialer,
+		Cache: livenessCache,
 	})
 
 	nodeRegistry.AddMetricStruct(nodeLiveness.Metrics())
-
-	// TODO(baptist): Refactor this to change the dependency between liveness and
-	// the dist sender. Today the persistence of liveness requires the distsender
-	// to read and write the liveness records, but the cache only needs the gossip
-	// struct. We could construct the liveness cache separately from the rest of
-	// liveness and use that to compute this rather than the entire liveness
-	// struct.
-	distSender.SetHealthFunc(func(id roachpb.NodeID) bool {
-		return nodeLiveness.GetNodeVitalityFromCache(id).IsLive(livenesspb.DistSender)
-	})
 
 	nodeLivenessFn := storepool.MakeStorePoolNodeLivenessFunc(nodeLiveness)
 	if nodeLivenessKnobs, ok := cfg.TestingKnobs.NodeLiveness.(kvserver.NodeLivenessTestingKnobs); ok {
@@ -1902,6 +1895,7 @@ func (s *topLevelServer) PreStart(ctx context.Context) error {
 		s.cfg.CPUProfileDirName,
 		s.runtime,
 		s.status.sessionRegistry,
+		s.sqlServer.execCfg.RootMemoryMonitor,
 	); err != nil {
 		return err
 	}
@@ -2106,6 +2100,7 @@ func (s *topLevelServer) PreStart(ctx context.Context) error {
 	s.eventsExporter.SetNodeInfo(obs.NodeInfo{
 		ClusterID:     state.clusterID,
 		NodeID:        int32(state.nodeID),
+		TenantID:      0,
 		BinaryVersion: build.BinaryVersion(),
 	})
 	if s.cfg.ObsServiceAddr != base.ObsServiceEmbedFlagValue {

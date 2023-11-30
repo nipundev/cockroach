@@ -592,9 +592,7 @@ func onCastTypeCheckHook(from, to types.Family) {
 		f()
 		return
 	}
-	panic(errors.AssertionFailedf(
-		"no cast counter found for cast from %s to %s", from.Name(), to.Name(),
-	))
+	panic(errors.AssertionFailedf("no cast counter found for cast from %s to %s", from.Name(), to.Name()))
 }
 
 func isArrayExpr(expr Expr) bool {
@@ -618,7 +616,12 @@ func (expr *CastExpr) TypeCheck(
 		return nil, err
 	}
 	expr.Type = exprType
-	canElideCast := true
+
+	// Do not elide casts for placeholders, since if the statement gets re-prepared,
+	// the cast may be needed to infer the placeholder type.
+	_, isPlaceholder := expr.Expr.(*Placeholder)
+	canElideCast := !isPlaceholder
+
 	switch {
 	case isConstant(expr.Expr):
 		c := expr.Expr.(Constant)

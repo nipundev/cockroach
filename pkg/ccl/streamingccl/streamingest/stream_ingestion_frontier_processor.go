@@ -78,6 +78,10 @@ type streamIngestionFrontier struct {
 	partitionProgress   map[string]jobspb.StreamIngestionProgress_PartitionProgress
 
 	lastNodeLagCheck time.Time
+
+	// replicatedTimeAtLastPositiveLagNodeCheck records the replicated time the
+	// last time the lagging node checker detected a lagging node.
+	replicatedTimeAtLastPositiveLagNodeCheck hlc.Timestamp
 }
 
 var _ execinfra.Processor = &streamIngestionFrontier{}
@@ -403,7 +407,6 @@ func (sf *streamIngestionFrontier) maybeUpdateProgress() error {
 	ctx := sf.Ctx()
 	updateFreq := streamingccl.JobCheckpointFrequency.Get(&sf.flowCtx.Cfg.Settings.SV)
 	if updateFreq == 0 || timeutil.Since(sf.lastPartitionUpdate) < updateFreq {
-		sf.updateLagMetric()
 		return nil
 	}
 	f := sf.frontier
@@ -421,7 +424,7 @@ func (sf *streamIngestionFrontier) maybeUpdateProgress() error {
 
 	sf.lastPartitionUpdate = timeutil.Now()
 	log.VInfof(ctx, 2, "persisting replicated time of %s", replicatedTime)
-	if err := registry.UpdateJobWithTxn(ctx, jobID, nil, false, func(
+	if err := registry.UpdateJobWithTxn(ctx, jobID, nil /* txn */, func(
 		txn isql.Txn, md jobs.JobMetadata, ju *jobs.JobUpdater,
 	) error {
 		if err := md.CheckRunningOrReverting(); err != nil {
@@ -486,17 +489,8 @@ func (sf *streamIngestionFrontier) maybeUpdateProgress() error {
 	}
 	sf.metrics.JobProgressUpdates.Inc(1)
 	sf.persistedReplicatedTime = f.Frontier()
-	sf.metrics.FrontierCheckpointSpanCount.Update(int64(len(frontierResolvedSpans)))
-	sf.updateLagMetric()
+	sf.metrics.ReplicatedTimeSeconds.Update(sf.persistedReplicatedTime.GoTime().Unix())
 	return nil
-}
-
-func (sf *streamIngestionFrontier) updateLagMetric() {
-	if !sf.persistedReplicatedTime.IsEmpty() {
-		// Only update the frontier lag if the replicated time has been updated,
-		// implying the initial scan has completed.
-		sf.metrics.FrontierLagNanos.Update(timeutil.Since(sf.persistedReplicatedTime.GoTime()).Nanoseconds())
-	}
 }
 
 // maybePersistFrontierEntries periodically persists the current state of the
@@ -525,7 +519,7 @@ func (sf *streamIngestionFrontier) maybePersistFrontierEntries() error {
 	}
 
 	if err = sf.FlowCtx.Cfg.DB.Txn(ctx, func(ctx context.Context, txn isql.Txn) error {
-		return jobs.WriteChunkedFileToJobInfo(ctx, frontierEntriesFilename, frontierBytes, txn, jobID, sf.EvalCtx.Settings.Version)
+		return jobs.WriteChunkedFileToJobInfo(ctx, frontierEntriesFilename, frontierBytes, txn, jobID)
 	}); err != nil {
 		return err
 	}
@@ -535,27 +529,47 @@ func (sf *streamIngestionFrontier) maybePersistFrontierEntries() error {
 }
 
 func (sf *streamIngestionFrontier) maybeCheckForLaggingNodes() error {
-	defer func() {
-		sf.lastNodeLagCheck = timeutil.Now()
-	}()
+	ctx := sf.Ctx()
 	checkFreq := streamingccl.ReplanFrequency.Get(&sf.FlowCtx.Cfg.Settings.SV)
 	maxLag := streamingccl.InterNodeLag.Get(&sf.FlowCtx.Cfg.Settings.SV)
 	if checkFreq == 0 || maxLag == 0 || timeutil.Since(sf.lastNodeLagCheck) < checkFreq {
+		log.VEventf(ctx, 2, "skipping lag replanning check: maxLag %d; checkFreq %.2f; last node check %s; time since last check %.2f",
+			maxLag, checkFreq.Minutes(), sf.lastNodeLagCheck, timeutil.Since(sf.lastNodeLagCheck).Minutes())
 		return nil
 	}
-
-	ctx := sf.Ctx()
-
 	// Don't check for lagging nodes if the hwm has yet to advance.
 	if sf.replicatedTimeAtStart.Equal(sf.persistedReplicatedTime) {
-		log.VEventf(ctx, 2, "skipping lagging nodes check as hwm has yet to advance past %s", sf.replicatedTimeAtStart)
+		log.VEventf(ctx, 2, "skipping lag replanning check: hwm has yet to advance past %s", sf.replicatedTimeAtStart)
 		return nil
 	}
-
+	defer func() {
+		sf.lastNodeLagCheck = timeutil.Now()
+	}()
 	executionDetails := constructSpanFrontierExecutionDetailsWithFrontier(sf.spec.PartitionSpecs, sf.frontier)
-
-	return checkLaggingNodes(
+	log.VEvent(ctx, 2, "checking for lagging nodes")
+	err := checkLaggingNodes(
+		ctx,
 		executionDetails,
 		maxLag,
 	)
+	return sf.handleLaggingNodeError(ctx, err)
+}
+
+func (sf *streamIngestionFrontier) handleLaggingNodeError(ctx context.Context, err error) error {
+	switch {
+	case err == nil:
+		sf.replicatedTimeAtLastPositiveLagNodeCheck = hlc.Timestamp{}
+		log.VEvent(ctx, 2, "no lagging nodes after check")
+		return nil
+	case !errors.Is(err, ErrNodeLagging):
+		return err
+	case sf.replicatedTimeAtLastPositiveLagNodeCheck.Less(sf.persistedReplicatedTime):
+		sf.replicatedTimeAtLastPositiveLagNodeCheck = sf.persistedReplicatedTime
+		log.Infof(ctx, "detected a lagging node: %s. Don't forward error because replicated time at last check %s is less than current replicated time %s", err, sf.replicatedTimeAtLastPositiveLagNodeCheck, sf.persistedReplicatedTime)
+		return nil
+	case sf.replicatedTimeAtLastPositiveLagNodeCheck.Equal(sf.persistedReplicatedTime):
+		return errors.Wrapf(err, "hwm has not advanced from %s", sf.persistedReplicatedTime)
+	default:
+		return errors.Wrapf(err, "unable to handle replanning error with replicated time %s and last node lag check replicated time %s", sf.persistedReplicatedTime, sf.replicatedTimeAtLastPositiveLagNodeCheck)
+	}
 }

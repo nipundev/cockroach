@@ -3349,6 +3349,130 @@ func TestChangefeedCustomKey(t *testing.T) {
 	cdcTest(t, testFn, feedTestForceSink("kafka"))
 }
 
+// Reproduce issue for #114196. This test verifies that changefeed with custom
+// key column works with CDC queries correctly.
+func TestChangefeedCustomKeyColumnWithCDCQuery(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	tests := map[string]struct {
+		shouldSkip           bool
+		createTableStmt      string
+		createChangeFeedStmt string
+		stmts                []string
+		payloadsAfterStmts   []string
+	}{
+		`select_star`: {
+			createTableStmt:      `CREATE TABLE foo (a INT PRIMARY KEY, b STRING, c STRING)`,
+			createChangeFeedStmt: `CREATE CHANGEFEED WITH key_column='b', unordered AS SELECT * FROM foo`,
+			stmts:                []string{`INSERT INTO foo VALUES (0, 'dog', 'cat')`, `INSERT INTO foo VALUES (1, 'dog1', 'cat1')`},
+			payloadsAfterStmts:   []string{`foo: ["dog"]->{"a": 0, "b": "dog", "c": "cat"}`, `foo: ["dog1"]->{"a": 1, "b": "dog1", "c": "cat1"}`},
+		},
+		`select_with_filter`: {
+			createTableStmt:      `CREATE TABLE foo (a INT PRIMARY KEY, b STRING, c STRING)`,
+			createChangeFeedStmt: `CREATE CHANGEFEED WITH key_column='b', unordered AS SELECT * FROM foo WHERE b='dog'`,
+			stmts:                []string{`INSERT INTO foo VALUES (0, 'dog', 'cat')`, `INSERT INTO foo VALUES (1, 'dog1', 'cat1')`},
+			payloadsAfterStmts:   []string{`foo: ["dog"]->{"a": 0, "b": "dog", "c": "cat"}`},
+		},
+		`select_multiple_columns`: {
+			createTableStmt:      `CREATE TABLE foo (a INT PRIMARY KEY, b STRING, c STRING)`,
+			createChangeFeedStmt: `CREATE CHANGEFEED WITH key_column='c', unordered AS SELECT b, c FROM foo WHERE b='dog'`,
+			stmts:                []string{`INSERT INTO foo VALUES (0, 'dog', 'cat')`, `INSERT INTO foo VALUES (1, 'dog1', 'cat1')`},
+			payloadsAfterStmts:   []string{`foo: ["cat"]->{"b": "dog", "c": "cat"}`},
+		},
+		`custom_key_with_created_column`: {
+			shouldSkip:           true,
+			createTableStmt:      `CREATE TABLE foo (a INT PRIMARY KEY, b STRING, c STRING)`,
+			createChangeFeedStmt: `CREATE CHANGEFEED WITH key_column='double_b', unordered AS SELECT concat(b, c) AS double_b FROM foo`,
+			stmts:                []string{`INSERT INTO foo VALUES (0, 'dog', 'cat')`, `INSERT INTO foo VALUES (1, 'dog1', 'cat1')`},
+			payloadsAfterStmts:   []string{`foo: ["cat"]->{"c": "cat"}`},
+		},
+		`select_star_with_builtin_funcs`: {
+			createTableStmt:      `CREATE TABLE foo (a INT PRIMARY KEY, b STRING, c STRING)`,
+			createChangeFeedStmt: `CREATE CHANGEFEED WITH key_column='c', unordered AS SELECT *, concat(b, c) FROM foo`,
+			stmts:                []string{`INSERT INTO foo VALUES (0, 'dog', 'cat')`, `INSERT INTO foo VALUES (1, 'dog1', 'cat1')`},
+			payloadsAfterStmts:   []string{`foo: ["cat"]->{"a": 0, "b": "dog", "c": "cat", "concat": "dogcat"}`, `foo: ["cat1"]->{"a": 1, "b": "dog1", "c": "cat1", "concat": "dog1cat1"}`},
+		},
+		`select_stored_column`: {
+			createTableStmt:      `CREATE TABLE foo (a INT PRIMARY KEY, b STRING, c STRING, d STRING AS (concat(b, c)) STORED)`,
+			createChangeFeedStmt: `CREATE CHANGEFEED WITH key_column='d', unordered AS SELECT * FROM foo WHERE d='dog1cat1'`,
+			stmts:                []string{`INSERT INTO foo VALUES (0, 'dog', 'cat')`, `INSERT INTO foo VALUES (1, 'dog1', 'cat1')`},
+			payloadsAfterStmts:   []string{`foo: ["dog1cat1"]->{"a": 1, "b": "dog1", "c": "cat1", "d": "dog1cat1"}`},
+		},
+		`select_virtual_column`: {
+			shouldSkip:           true,
+			createTableStmt:      `CREATE TABLE foo (a INT PRIMARY KEY, b STRING, c STRING, d STRING AS (concat(b, c)) VIRTUAL)`,
+			createChangeFeedStmt: `CREATE CHANGEFEED WITH key_column='d', unordered AS SELECT d FROM foo WHERE d='dog1cat1'`,
+			stmts:                []string{`INSERT INTO foo VALUES (0, 'dog', 'cat')`, `INSERT INTO foo VALUES (1, 'dog1', 'cat1')`},
+			payloadsAfterStmts:   []string{`foo: ["dog1cat1"]->{"a": 1, "b": "dog1", "c": "cat1", "d": "dog1cat1"}`},
+		},
+		`select_with_filter_IN`: {
+			createTableStmt:      `CREATE TABLE foo (a INT PRIMARY KEY, b STRING)`,
+			createChangeFeedStmt: `CREATE CHANGEFEED WITH key_column='b', unordered AS SELECT * FROM foo WHERE b IN ('dog', 'dog1')`,
+			stmts:                []string{`INSERT INTO foo VALUES (0, 'dog')`, `INSERT INTO foo VALUES (1, 'dog1')`},
+			payloadsAfterStmts:   []string{`foo: ["dog"]->{"a": 0, "b": "dog"}`, `foo: ["dog1"]->{"a": 1, "b": "dog1"}`},
+		},
+		`select_with_delete`: {
+			createTableStmt:      `CREATE TABLE foo (a INT PRIMARY KEY, b STRING)`,
+			createChangeFeedStmt: `CREATE CHANGEFEED WITH key_column='b', unordered AS SELECT *, event_op() = 'delete' AS deleted FROM foo WHERE 'hello' != 'world'`,
+			stmts:                []string{`INSERT INTO foo VALUES (0, 'dog')`, `INSERT INTO foo VALUES (1, 'dog1')`, `DELETE FROM foo WHERE a=1`},
+			payloadsAfterStmts:   []string{`foo: [null]->{"a": 1, "b": null, "deleted": true}`, `foo: ["dog"]->{"a": 0, "b": "dog", "deleted": false}`, `foo: ["dog1"]->{"a": 1, "b": "dog1", "deleted": false}`},
+		},
+		`select_with_filter_delete`: {
+			createTableStmt:      `CREATE TABLE foo (a INT PRIMARY KEY, b STRING)`,
+			createChangeFeedStmt: `CREATE CHANGEFEED WITH key_column='b', unordered AS SELECT * FROM foo WHERE event_op() = 'delete'`,
+			stmts:                []string{`INSERT INTO foo VALUES (0, 'dog')`, `INSERT INTO foo VALUES (1, 'dog1')`, `DELETE FROM foo WHERE a=1`},
+			payloadsAfterStmts:   []string{`foo: [null]->{"a": 1, "b": null}`},
+		},
+		`select_with_cdc_prev`: {
+			createTableStmt:      `CREATE TABLE foo (a INT PRIMARY KEY, b STRING)`,
+			createChangeFeedStmt: `CREATE CHANGEFEED WITH key_column='b', unordered AS SELECT *, (cdc_prev) FROM foo`,
+			stmts:                []string{`INSERT INTO foo VALUES (0, 'dog')`, `UPSERT INTO foo VALUES (0,'dog1')`},
+			payloadsAfterStmts:   []string{`foo: ["dog"]->{"a": 0, "b": "dog", "cdc_prev": null}`, `foo: ["dog1"]->{"a": 0, "b": "dog1", "cdc_prev": {"a": 0, "b": "dog"}}`},
+		},
+		`select_with_filter_cdc_prev`: {
+			createTableStmt:      `CREATE TABLE foo (a INT PRIMARY KEY, b STRING)`,
+			createChangeFeedStmt: `CREATE CHANGEFEED WITH key_column='b', unordered AS SELECT b FROM foo WHERE (cdc_prev).a = 0`,
+			stmts:                []string{`INSERT INTO foo VALUES (0, 'dog')`, `UPSERT INTO foo VALUES (0, 'dog1')`},
+			payloadsAfterStmts:   []string{`foo: ["dog1"]->{"b": "dog1"}`},
+		},
+		`select_with_hidden_column`: {
+			createTableStmt:      `CREATE TABLE foo (a INT PRIMARY KEY, b STRING NOT VISIBLE)`,
+			createChangeFeedStmt: `CREATE CHANGEFEED WITH key_column='b', unordered AS SELECT b FROM foo`,
+			stmts:                []string{`INSERT INTO foo(a,b) VALUES (0, 'dog')`, `INSERT INTO foo(a,b) VALUES (1, 'dog1')`},
+			payloadsAfterStmts:   []string{`foo: ["dog"]->{"b": "dog"}`, `foo: ["dog1"]->{"b": "dog1"}`},
+		},
+		`select_with_cdc_prev_column`: {
+			shouldSkip:           true,
+			createTableStmt:      `CREATE TABLE foo (a INT PRIMARY KEY, b STRING)`,
+			createChangeFeedStmt: `CREATE CHANGEFEED WITH key_column='cdc_prev.a', unordered AS SELECT * FROM foo`,
+			stmts:                []string{`INSERT INTO foo(a,b) VALUES (0, 'dog')`, `INSERT INTO foo(a,b) VALUES (1, 'dog1')`},
+			payloadsAfterStmts:   []string{`foo: ["dog"]->{"b": "dog"}`, `foo: ["dog1"]->{"b": "dog1"}`},
+		},
+	}
+
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			if test.shouldSkip {
+				t.Logf("skipping this test because %s is currently not supported; "+
+					"see #115267 for more details", name)
+				return
+			}
+			testFn := func(t *testing.T, s TestServer, f cdctest.TestFeedFactory) {
+				sqlDB := sqlutils.MakeSQLRunner(s.DB)
+				sqlDB.Exec(t, test.createTableStmt)
+				foo := feed(t, f, test.createChangeFeedStmt)
+				defer closeFeed(t, foo)
+				for _, stmt := range test.stmts {
+					sqlDB.Exec(t, stmt)
+				}
+				assertPayloads(t, foo, test.payloadsAfterStmts)
+			}
+			cdcTest(t, testFn, feedTestForceSink("kafka"))
+		})
+	}
+}
+
 func TestChangefeedCustomKeyAvro(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
@@ -5782,7 +5906,7 @@ func TestChangefeedContinuousTelemetry(t *testing.T) {
 	testFn := func(t *testing.T, s TestServer, f cdctest.TestFeedFactory) {
 		// Hack: since setting a zero value disabled, set a negative value to ensure we always log.
 		interval := -10 * time.Millisecond
-		ContinuousTelemetryInterval.Override(context.Background(), &s.Server.ClusterSettings().SV, interval)
+		continuousTelemetryInterval.Override(context.Background(), &s.Server.ClusterSettings().SV, interval)
 
 		sqlDB := sqlutils.MakeSQLRunner(s.DB)
 		sqlDB.Exec(t, `CREATE TABLE foo (id INT PRIMARY KEY)`)
@@ -5794,7 +5918,7 @@ func TestChangefeedContinuousTelemetry(t *testing.T) {
 		for i := 0; i < 5; i++ {
 			beforeCreate := timeutil.Now()
 			sqlDB.Exec(t, fmt.Sprintf(`INSERT INTO foo VALUES (%d) RETURNING cluster_logical_timestamp()`, i))
-			verifyLogsWithEmittedBytes(t, jobID, beforeCreate.UnixNano(), interval.Nanoseconds(), false)
+			verifyLogsWithEmittedBytesAndMessages(t, jobID, beforeCreate.UnixNano(), interval.Nanoseconds(), false)
 		}
 	}
 
@@ -5808,7 +5932,7 @@ func TestChangefeedContinuousTelemetryOnTermination(t *testing.T) {
 
 	testFn := func(t *testing.T, s TestServer, f cdctest.TestFeedFactory) {
 		interval := 24 * time.Hour
-		ContinuousTelemetryInterval.Override(context.Background(), &s.Server.ClusterSettings().SV, interval)
+		continuousTelemetryInterval.Override(context.Background(), &s.Server.ClusterSettings().SV, interval)
 		beforeCreate := timeutil.Now()
 		sqlDB := sqlutils.MakeSQLRunner(s.DB)
 		sqlDB.Exec(t, `CREATE TABLE foo (id INT PRIMARY KEY)`)
@@ -5817,7 +5941,7 @@ func TestChangefeedContinuousTelemetryOnTermination(t *testing.T) {
 		foo := feed(t, f, `CREATE CHANGEFEED FOR foo`)
 		jobID := foo.(cdctest.EnterpriseTestFeed).JobID()
 		sqlDB.Exec(t, `INSERT INTO foo VALUES (1)`)
-		verifyLogsWithEmittedBytes(t, jobID, beforeCreate.UnixNano(), interval.Nanoseconds(), false)
+		verifyLogsWithEmittedBytesAndMessages(t, jobID, beforeCreate.UnixNano(), interval.Nanoseconds(), false)
 
 		// Insert more rows. No logs should be created for these since we recently
 		// published them above and the interval is 24h.
@@ -5832,7 +5956,7 @@ func TestChangefeedContinuousTelemetryOnTermination(t *testing.T) {
 		// Close the changefeed and ensure logs were created after closing.
 		beforeClose := timeutil.Now()
 		require.NoError(t, foo.Close())
-		verifyLogsWithEmittedBytes(t, jobID, beforeClose.UnixNano(), interval.Nanoseconds(), true)
+		verifyLogsWithEmittedBytesAndMessages(t, jobID, beforeClose.UnixNano(), interval.Nanoseconds(), true)
 	}
 
 	// TODO(#89421): include pubsub once it supports metrics
@@ -5846,7 +5970,7 @@ func TestChangefeedContinuousTelemetryDifferentJobs(t *testing.T) {
 	testFn := func(t *testing.T, s TestServer, f cdctest.TestFeedFactory) {
 		// Hack: since setting a zero value disabled, set a negative value to ensure we always log.
 		interval := -100 * time.Millisecond
-		ContinuousTelemetryInterval.Override(context.Background(), &s.Server.ClusterSettings().SV, interval)
+		continuousTelemetryInterval.Override(context.Background(), &s.Server.ClusterSettings().SV, interval)
 		sqlDB := sqlutils.MakeSQLRunner(s.DB)
 		sqlDB.Exec(t, `CREATE TABLE foo (id INT PRIMARY KEY)`)
 		sqlDB.Exec(t, `CREATE TABLE foo2 (id INT PRIMARY KEY)`)
@@ -5859,13 +5983,13 @@ func TestChangefeedContinuousTelemetryDifferentJobs(t *testing.T) {
 		beforeInsert := timeutil.Now()
 		sqlDB.Exec(t, `INSERT INTO foo VALUES (1)`)
 		sqlDB.Exec(t, `INSERT INTO foo2 VALUES (1)`)
-		verifyLogsWithEmittedBytes(t, job1, beforeInsert.UnixNano(), interval.Nanoseconds(), false)
-		verifyLogsWithEmittedBytes(t, job2, beforeInsert.UnixNano(), interval.Nanoseconds(), false)
+		verifyLogsWithEmittedBytesAndMessages(t, job1, beforeInsert.UnixNano(), interval.Nanoseconds(), false)
+		verifyLogsWithEmittedBytesAndMessages(t, job2, beforeInsert.UnixNano(), interval.Nanoseconds(), false)
 		require.NoError(t, foo.Close())
 
 		beforeInsert = timeutil.Now()
 		sqlDB.Exec(t, `INSERT INTO foo2 VALUES (2)`)
-		verifyLogsWithEmittedBytes(t, job2, beforeInsert.UnixNano(), interval.Nanoseconds(), false)
+		verifyLogsWithEmittedBytesAndMessages(t, job2, beforeInsert.UnixNano(), interval.Nanoseconds(), false)
 		require.NoError(t, foo2.Close())
 	}
 
@@ -6882,6 +7006,41 @@ func TestCheckpointFrequency(t *testing.T) {
 	js.checkpointCompleted(ctx, 42*time.Second)
 	require.Equal(t, completionTime, js.lastProgressUpdate)
 	require.False(t, js.progressUpdatesSkipped)
+}
+
+func TestFlushJitter(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	// Test the logic around applying jitter to the flush logic.
+	// The more involved test that would try to capture flush times would likely
+	// be pretty flaky due to the fact that flush times do not happen at exactly
+	// min_flush_frequency period, and thus it would be hard to tell if the
+	// difference is due to jitter or not.  Just verify nextFlushWithJitter function
+	// works as expected with controlled time source.
+	const flushFrequency time.Duration = 100 * time.Millisecond
+	ts := timeutil.NewManualTime(timeutil.Now())
+
+	const numIters = 100
+	t.Run("disable", func(t *testing.T) {
+		const disableJitter = 0.0
+		for i := 0; i < numIters; i++ {
+			next := nextFlushWithJitter(ts, flushFrequency, disableJitter)
+			require.Equal(t, ts.Now().Add(flushFrequency), next)
+			ts.AdvanceTo(next)
+		}
+	})
+	t.Run("enable", func(t *testing.T) {
+		const jitter = 0.1
+		for i := 0; i < numIters; i++ {
+			next := nextFlushWithJitter(ts, flushFrequency, jitter)
+			// next flush should be at least flushFrequency into the future.
+			require.LessOrEqual(t, ts.Now().Add(flushFrequency), next, t)
+			// and jitter should be at most 10% more than flushFrequency (10ms)
+			require.Less(t, next.Sub(ts.Now()), flushFrequency+flushFrequency/10)
+			ts.AdvanceTo(next)
+		}
+	})
 }
 
 func TestChangefeedOrderingWithErrors(t *testing.T) {

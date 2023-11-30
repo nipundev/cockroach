@@ -28,7 +28,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvcoord"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
@@ -44,9 +43,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/desctestutils"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/lease"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/systemschema"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
+	"github.com/cockroachdb/cockroach/pkg/sql/regions"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc/keyside"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
@@ -81,16 +82,16 @@ type leaseTest struct {
 }
 
 func init() {
-	lease.MoveTablePrimaryIndexIDto2 = func(
-		ctx context.Context, t *testing.T, s serverutils.ApplicationLayerInterface, id descpb.ID,
+	lease.MoveTablePrimaryIndexIDtoTarget = func(
+		ctx context.Context, t *testing.T, s serverutils.ApplicationLayerInterface, id descpb.ID, indexID descpb.IndexID,
 	) {
 		require.NoError(t, sql.TestingDescsTxn(ctx, s, func(ctx context.Context, txn isql.Txn, col *descs.Collection) error {
 			t, err := col.MutableByID(txn.KV()).Table(ctx, id)
 			if err != nil {
 				return err
 			}
-			t.PrimaryIndex.ID = 2
-			t.NextIndexID++
+			t.PrimaryIndex.ID = indexID
+			t.NextIndexID = indexID + 1
 			return col.WriteDesc(ctx, false /* kvTrace */, t, txn.KV())
 		}))
 	}
@@ -2027,12 +2028,8 @@ func TestTableCreationPushesTxnsInRecentPast(t *testing.T) {
 	tc := serverutils.StartCluster(t, 3, base.TestClusterArgs{
 		ServerArgs: base.TestServerArgs{
 			Knobs: base.TestingKnobs{
-				KVClient: &kvcoord.ClientTestingKnobs{
-					// Intentionally add latency so that the uncertainty
-					// limit is higher to reduce the risk of this test flaking.
-					LatencyFunc: func(id roachpb.NodeID) (time.Duration, bool) {
-						return time.Millisecond * 100, true
-					},
+				Store: &kvserver.StoreTestingKnobs{
+					MaxOffset: time.Second,
 				},
 			},
 			DefaultTestTenant: base.TestDoesNotWorkWithSecondaryTenantsButWeDontKnowWhyYet(109385),
@@ -2707,7 +2704,9 @@ func TestHistoricalDescriptorAcquire(t *testing.T) {
 
 	// Acquire descriptor version valid at timestamp ts1. Waits for the most
 	// recent version with the name column before doing so.
-	_, err = s.LeaseManager().(*lease.Manager).WaitForOneVersion(ctx, tableID.Load().(descpb.ID), base.DefaultRetryOptions())
+	cachedDatabaseRegions, err := regions.NewCachedDatabaseRegions(ctx, s.DB(), s.LeaseManager().(*lease.Manager))
+	require.NoError(t, err)
+	_, err = s.LeaseManager().(*lease.Manager).WaitForOneVersion(ctx, tableID.Load().(descpb.ID), cachedDatabaseRegions, base.DefaultRetryOptions())
 	require.NoError(t, err, "Failed to wait for one version of descriptor: %s", err)
 	acquiredDescriptor, err := s.LeaseManager().(*lease.Manager).Acquire(ctx, ts1, tableID.Load().(descpb.ID))
 	assert.NoError(t, err)
@@ -3476,4 +3475,29 @@ func TestDescriptorRemovedFromCacheWhenLeaseRenewalForThisDescriptorFails(t *tes
 		return errors.Errorf("descriptor %v(#%v) is still there. Expected: descriptor removed from cache.",
 			typeDesc.GetName(), typeDesc.GetID())
 	})
+}
+
+// TestSessionLeasingTable validates that we can use an internal table
+// to read new system.leases table format (which will use synthetic
+// descriptors).
+func TestSessionLeasingTable(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	ctx := context.Background()
+	srv, sqlDB, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	defer srv.Stopper().Stop(ctx)
+	runner := sqlutils.MakeSQLRunner(sqlDB)
+
+	executor := srv.InternalExecutor().(isql.Executor)
+	// Insert using a synthetic descriptor.
+	err := executor.WithSyntheticDescriptors(catalog.Descriptors{systemschema.LeaseTable_V24_1()}, func() error {
+		_, err := executor.Exec(ctx, "add-rows-for-test", nil,
+			"INSERT INTO system.lease VALUES (1, -1, 1, 'some session id', 'region')")
+		return err
+	})
+	require.NoError(t, err)
+	// Validate the new crdb_internal function can read the contents back.
+	res := runner.QueryStr(t, "SELECT * FROM crdb_internal.kv_session_based_leases;")
+	require.Equal(t, [][]string{{"1", "-1", "1", "some session id", "region"}}, res)
 }

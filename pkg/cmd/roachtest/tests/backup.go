@@ -100,7 +100,7 @@ func importBankDataSplit(
 
 	// NB: starting the cluster creates the logs dir as a side effect,
 	// needed below.
-	c.Start(ctx, t.L(), maybeUseMemoryBudget(t, 50), install.MakeClusterSettings())
+	c.Start(ctx, t.L(), option.DefaultStartOptsNoBackups(), install.MakeClusterSettings())
 	runImportBankDataSplit(ctx, rows, ranges, t, c)
 	return dest
 }
@@ -264,6 +264,13 @@ func registerBackupNodeShutdown(r registry.Registry) {
 
 // fingerprint returns a fingerprint of `db.table`.
 func fingerprint(ctx context.Context, conn *gosql.DB, db, table string) (string, error) {
+	// See #113816 for why this is needed for now (probably until #94850 is
+	// resolved).
+	_, err := conn.Exec("SET direct_columnar_scans_enabled = false;")
+	if err != nil {
+		return "", err
+	}
+
 	var b strings.Builder
 
 	query := fmt.Sprintf("SHOW EXPERIMENTAL_FINGERPRINTS FROM TABLE %s.%s", db, table)
@@ -503,31 +510,12 @@ func registerBackup(r registry.Registry) {
 						return err
 					}
 
-					fingerprint := func(db string) (string, error) {
-						var b strings.Builder
-
-						query := fmt.Sprintf("SHOW EXPERIMENTAL_FINGERPRINTS FROM TABLE %s.%s", db, "bank")
-						rows, err := conn.QueryContext(ctx, query)
-						if err != nil {
-							return "", err
-						}
-						defer rows.Close()
-						for rows.Next() {
-							var name, fp string
-							if err := rows.Scan(&name, &fp); err != nil {
-								return "", err
-							}
-							fmt.Fprintf(&b, "%s: %s\n", name, fp)
-						}
-
-						return b.String(), rows.Err()
-					}
-
-					originalBank, err := fingerprint("bank")
+					table := "bank"
+					originalBank, err := fingerprint(ctx, conn, "bank" /* db */, table)
 					if err != nil {
 						return err
 					}
-					restore, err := fingerprint("restoreDB")
+					restore, err := fingerprint(ctx, conn, "restoreDB" /* db */, table)
 					if err != nil {
 						return err
 					}
@@ -641,35 +629,16 @@ func registerBackup(r registry.Registry) {
 					}
 
 					t.Status(`fingerprint`)
-					fingerprint := func(db string) (string, error) {
-						var b strings.Builder
-
-						query := fmt.Sprintf("SHOW EXPERIMENTAL_FINGERPRINTS FROM TABLE %s.%s", db, "bank")
-						rows, err := conn.QueryContext(ctx, query)
-						if err != nil {
-							return "", err
-						}
-						defer rows.Close()
-						for rows.Next() {
-							var name, fp string
-							if err := rows.Scan(&name, &fp); err != nil {
-								return "", err
-							}
-							fmt.Fprintf(&b, "%s: %s\n", name, fp)
-						}
-
-						return b.String(), rows.Err()
-					}
-
-					originalBank, err := fingerprint("bank")
+					table := "bank"
+					originalBank, err := fingerprint(ctx, conn, "bank" /* db */, table)
 					if err != nil {
 						return err
 					}
-					restoreA, err := fingerprint("restoreA")
+					restoreA, err := fingerprint(ctx, conn, "restoreA" /* db */, table)
 					if err != nil {
 						return err
 					}
-					restoreB, err := fingerprint("restoreB")
+					restoreB, err := fingerprint(ctx, conn, "restoreB" /* db */, table)
 					if err != nil {
 						return err
 					}
@@ -744,7 +713,7 @@ func runBackupMVCCRangeTombstones(
 ) {
 	if !config.skipClusterSetup {
 		c.Put(ctx, t.DeprecatedWorkload(), "./workload") // required for tpch
-		c.Start(ctx, t.L(), maybeUseMemoryBudget(t, 50), install.MakeClusterSettings())
+		c.Start(ctx, t.L(), option.DefaultStartOptsNoBackups(), install.MakeClusterSettings())
 	}
 	t.Status("starting csv servers")
 	c.Run(ctx, c.All(), `./cockroach workload csv-server --port=8081 &> logs/workload-csv-server.log < /dev/null &`)
@@ -755,8 +724,7 @@ func runBackupMVCCRangeTombstones(
 	t.Status("configuring cluster")
 	_, err := conn.Exec(`SET CLUSTER SETTING kv.bulk_ingest.max_index_buffer_size = '2gb'`)
 	require.NoError(t, err)
-	_, err = conn.Exec(`SET CLUSTER SETTING server.debug.default_vmodule = 'txn=2,sst_batcher=4,
-revert=2'`)
+	_, err = conn.Exec(`SET CLUSTER SETTING server.debug.default_vmodule = 'txn=2,sst_batcher=4,revert=2'`)
 	require.NoError(t, err)
 	// Wait for ranges to upreplicate.
 	require.NoError(t, WaitFor3XReplication(ctx, t, conn))

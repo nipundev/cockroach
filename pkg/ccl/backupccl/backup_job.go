@@ -26,6 +26,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/ccl/backupccl/backupinfo"
 	"github.com/cockroachdb/cockroach/pkg/ccl/backupccl/backuppb"
 	"github.com/cockroachdb/cockroach/pkg/ccl/backupccl/backuputils"
+	"github.com/cockroachdb/cockroach/pkg/ccl/kvccl/kvfollowerreadsccl"
 	"github.com/cockroachdb/cockroach/pkg/ccl/utilccl"
 	"github.com/cockroachdb/cockroach/pkg/cloud"
 	"github.com/cockroachdb/cockroach/pkg/cloud/cloudpb"
@@ -87,6 +88,12 @@ var BackupCheckpointInterval = settings.RegisterDurationSetting(
 	time.Minute)
 
 var forceReadBackupManifest = util.ConstantWithMetamorphicTestBool("backup-read-manifest", false)
+
+var useBulkOracle = settings.RegisterBoolSetting(
+	settings.ApplicationLevel,
+	"bulkio.backup.balanced_distribution.enabled",
+	"randomize the selection of which replica backs up each range",
+	true)
 
 func countRows(raw kvpb.BulkOpSummary, pkIDs map[uint64]bool) roachpb.RowCount {
 	res := roachpb.RowCount{DataSize: raw.DataSize}
@@ -199,10 +206,15 @@ func backup(
 	evalCtx := execCtx.ExtendedEvalContext()
 	dsp := execCtx.DistSQLPlanner()
 
+	oracle := physicalplan.DefaultReplicaChooser
+	if useBulkOracle.Get(&evalCtx.Settings.SV) {
+		oracle = kvfollowerreadsccl.NewBulkOracle(dsp.ReplicaOracleConfig(evalCtx.Locality), execLocality)
+	}
+
 	// We don't return the compatible nodes here since PartitionSpans will
 	// filter out incompatible nodes.
 	planCtx, _, err := dsp.SetupAllNodesPlanningWithOracle(
-		ctx, evalCtx, execCtx.ExecCfg(), physicalplan.DefaultReplicaChooser, execLocality,
+		ctx, evalCtx, execCtx.ExecCfg(), oracle, execLocality,
 	)
 	if err != nil {
 		return roachpb.RowCount{}, 0, errors.Wrap(err, "failed to determine nodes on which to run")
@@ -262,7 +274,7 @@ func backup(
 					return nil
 				}
 				jobsprofiler.StorePerNodeProcessorProgressFraction(
-					ctx, execCtx.ExecCfg().InternalDB, job.ID(), prog, execCtx.ExecCfg().Settings.Version)
+					ctx, execCtx.ExecCfg().InternalDB, job.ID(), prog)
 			case <-ctx.Done():
 				return ctx.Err()
 			}
@@ -371,7 +383,7 @@ func backup(
 			progCh,
 			tracingAggCh,
 			backupSpecs,
-		), "exporting %d ranges", errors.Safe(numTotalSpans))
+		), "running distributed backup to export %d ranges", errors.Safe(numTotalSpans))
 	}
 
 	if err := ctxgroup.GoAndWait(
@@ -734,7 +746,7 @@ func (b *backupResumer) Resume(ctx context.Context, execCtx interface{}) error {
 
 		// Collect telemetry, once per backup after resolving its destination.
 		lic := utilccl.CheckEnterpriseEnabled(
-			p.ExecCfg().Settings, p.ExecCfg().NodeInfo.LogicalClusterID(), "",
+			p.ExecCfg().Settings, "",
 		) != nil
 		collectTelemetry(ctx, backupManifest, initialDetails, details, lic, b.job.ID())
 	}
@@ -1259,135 +1271,6 @@ func planSchedulePTSChaining(
 	return nil
 }
 
-// getReintroducedSpans checks to see if any spans need to be re-backed up from
-// ts = 0. This may be the case if a span was OFFLINE in the previous backup and
-// has come back online since. The entire span needs to be re-backed up because
-// we may otherwise miss AddSSTable requests which write to a timestamp older
-// than the last incremental.
-func getReintroducedSpans(
-	ctx context.Context,
-	execCfg *sql.ExecutorConfig,
-	prevBackups []backuppb.BackupManifest,
-	layerToIterFactory backupinfo.LayerToBackupManifestFileIterFactory,
-	tables []catalog.TableDescriptor,
-	revs []backuppb.BackupManifest_DescriptorRevision,
-	endTime hlc.Timestamp,
-) ([]roachpb.Span, error) {
-	reintroducedTables := make(map[descpb.ID]struct{})
-
-	// First, create a map that indicates which tables from the previous backup
-	// were offline when the last backup was taken. To create this map, we must
-	// iterate two fields in the _last_ backup's manifest:
-	//
-	// 1. manifest.Descriptors contains a list of descriptors _explicitly_
-	// included in the backup, gathered at backup startTime. This includes all
-	// public descriptors, and in the case of cluster backups, offline
-	// descriptors.
-	//
-	// 2. manifest.DescriptorChanges contains a list of descriptor changes tracked
-	// in the backup. While investigating #88042, it was discovered that during
-	// revision history database and table.* backups, a table can get included in
-	// manifest.DescriptorChanges when it transitions from an online to offline
-	// state, causing its spans to get backed up. However, if this table was
-	// offline when the backup began, it's excluded from manifest.Descriptors.
-	// Therefore, to find all descriptors covered in the backup that were offline
-	// at backup time, we must find all tables in manifest.DescriptorChanges whose
-	// last change brought the table offline.
-	offlineInLastBackup := make(map[descpb.ID]struct{})
-	lastIterFactory := layerToIterFactory[len(prevBackups)-1]
-
-	descIt := lastIterFactory.NewDescIter(ctx)
-	defer descIt.Close()
-
-	for ; ; descIt.Next() {
-		if ok, err := descIt.Valid(); err != nil {
-			return nil, err
-		} else if !ok {
-			break
-		}
-
-		// TODO(pbardea): Also check that lastWriteTime is set once those are
-		// populated on the table descriptor.
-		if table, _, _, _, _ := descpb.GetDescriptors(descIt.Value()); table != nil && table.Offline() {
-			offlineInLastBackup[table.GetID()] = struct{}{}
-		}
-	}
-
-	// Gather all the descriptors that were offline at the endTime of the last
-	// backup, according the backup's descriptor changes. If the last descriptor
-	// change in the previous backup interval put the table offline, then that
-	// backup was offline at the endTime of the last backup.
-	latestTableDescChangeInLastBackup := make(map[descpb.ID]*descpb.TableDescriptor)
-	descRevIt := lastIterFactory.NewDescriptorChangesIter(ctx)
-	defer descRevIt.Close()
-	for ; ; descRevIt.Next() {
-		if ok, err := descRevIt.Valid(); err != nil {
-			return nil, err
-		} else if !ok {
-			break
-		}
-
-		if table, _, _, _, _ := descpb.GetDescriptors(descRevIt.Value().Desc); table != nil {
-			if trackedRev, ok := latestTableDescChangeInLastBackup[table.GetID()]; !ok {
-				latestTableDescChangeInLastBackup[table.GetID()] = table
-			} else if trackedRev.Version < table.Version {
-				latestTableDescChangeInLastBackup[table.GetID()] = table
-			}
-		}
-	}
-
-	for _, table := range latestTableDescChangeInLastBackup {
-		if table.Offline() {
-			offlineInLastBackup[table.GetID()] = struct{}{}
-		}
-	}
-
-	// If the table was offline in the last backup, but becomes PUBLIC, then it
-	// needs to be re-included since we may have missed non-transactional writes.
-	tablesToReinclude := make([]catalog.TableDescriptor, 0)
-	for _, desc := range tables {
-		if _, wasOffline := offlineInLastBackup[desc.GetID()]; wasOffline && desc.Public() {
-			tablesToReinclude = append(tablesToReinclude, desc)
-			reintroducedTables[desc.GetID()] = struct{}{}
-		}
-	}
-
-	// Tables should be re-introduced if any revision of the table was PUBLIC. A
-	// table may have been OFFLINE at the time of the last backup, and OFFLINE at
-	// the time of the current backup, but may have been PUBLIC at some time in
-	// between.
-	for _, rev := range revs {
-		rawTable, _, _, _, _ := descpb.GetDescriptors(rev.Desc)
-		if rawTable == nil {
-			continue
-		}
-		table := tabledesc.NewBuilder(rawTable).BuildImmutableTable()
-		if _, wasOffline := offlineInLastBackup[table.GetID()]; wasOffline && table.Public() {
-			tablesToReinclude = append(tablesToReinclude, table)
-			reintroducedTables[table.GetID()] = struct{}{}
-		}
-	}
-
-	// All revisions of the table that we're re-introducing must also be
-	// considered.
-	allRevs := make([]backuppb.BackupManifest_DescriptorRevision, 0, len(revs))
-	for _, rev := range revs {
-		rawTable, _, _, _, _ := descpb.GetDescriptors(rev.Desc)
-		if rawTable == nil {
-			continue
-		}
-		if _, ok := reintroducedTables[rawTable.GetID()]; ok {
-			allRevs = append(allRevs, rev)
-		}
-	}
-
-	tableSpans, err := spansForAllTableIndexes(execCfg, tablesToReinclude, allRevs)
-	if err != nil {
-		return nil, err
-	}
-	return tableSpans, nil
-}
-
 func getProtectedTimestampTargetForBackup(
 	backupManifest *backuppb.BackupManifest,
 ) (*ptpb.Target, error) {
@@ -1558,26 +1441,20 @@ func checkForNewTables(
 }
 
 func getTenantInfo(
-	ctx context.Context,
-	settings *cluster.Settings,
-	codec keys.SQLCodec,
-	txn isql.Txn,
-	jobDetails jobspb.BackupDetails,
+	ctx context.Context, codec keys.SQLCodec, txn isql.Txn, jobDetails jobspb.BackupDetails,
 ) ([]roachpb.Span, []mtinfopb.TenantInfoWithUsage, error) {
 	var spans []roachpb.Span
 	var tenants []mtinfopb.TenantInfoWithUsage
 	var err error
 	if jobDetails.FullCluster && codec.ForSystemTenant() && jobDetails.IncludeAllSecondaryTenants {
 		// Include all tenants.
-		tenants, err = retrieveAllTenantsMetadata(
-			ctx, txn, settings,
-		)
+		tenants, err = retrieveAllTenantsMetadata(ctx, txn)
 		if err != nil {
 			return nil, nil, err
 		}
 	} else if len(jobDetails.SpecificTenantIds) > 0 {
 		for _, id := range jobDetails.SpecificTenantIds {
-			tenantInfo, err := retrieveSingleTenantMetadata(ctx, txn, id, settings)
+			tenantInfo, err := retrieveSingleTenantMetadata(ctx, txn, id)
 			if err != nil {
 				return nil, nil, err
 			}
@@ -1669,7 +1546,7 @@ func createBackupManifest(
 		}
 	}
 
-	var newSpans, reintroducedSpans roachpb.Spans
+	var newSpans roachpb.Spans
 	var priorIDs map[descpb.ID]descpb.ID
 
 	var revs []backuppb.BackupManifest_DescriptorRevision
@@ -1684,9 +1561,7 @@ func createBackupManifest(
 
 	var spans []roachpb.Span
 	var tenants []mtinfopb.TenantInfoWithUsage
-	tenantSpans, tenantInfos, err := getTenantInfo(
-		ctx, execCfg.Settings, execCfg.Codec, txn, jobDetails,
-	)
+	tenantSpans, tenantInfos, err := getTenantInfo(ctx, execCfg.Codec, txn, jobDetails)
 	if err != nil {
 		return backuppb.BackupManifest{}, err
 	}
@@ -1732,12 +1607,6 @@ func createBackupManifest(
 		}
 
 		newSpans = filterSpans(spans, prevBackups[len(prevBackups)-1].Spans)
-
-		reintroducedSpans, err = getReintroducedSpans(ctx, execCfg, prevBackups, layerToIterFactory, tables, revs, endTime)
-		if err != nil {
-			return backuppb.BackupManifest{}, err
-		}
-		newSpans = append(newSpans, reintroducedSpans...)
 	}
 
 	// if CompleteDbs is lost by a 1.x node, FormatDescriptorTrackingVersion
@@ -2095,7 +1964,7 @@ func (b *backupResumer) CollectProfile(ctx context.Context, execCtx interface{})
 		aggStatsCopy = b.mu.perNodeAggregatorStats.DeepCopy()
 	}()
 	return bulkutil.FlushTracingAggregatorStats(ctx, b.job.ID(),
-		p.ExecCfg().InternalDB, aggStatsCopy, p.ExecCfg().Settings.Version)
+		p.ExecCfg().InternalDB, aggStatsCopy)
 }
 
 func (b *backupResumer) deleteCheckpoint(

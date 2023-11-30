@@ -6285,63 +6285,6 @@ SELECT
 		},
 	),
 
-	// Returns true iff the current user has admin role.
-	// Note: it would be a privacy leak to extend this to check arbitrary usernames.
-	"crdb_internal.is_admin": makeBuiltin(
-		tree.FunctionProperties{
-			Category:         builtinconstants.CategorySystemInfo,
-			DistsqlBlocklist: true,
-		},
-		tree.Overload{
-			Types:      tree.ParamTypes{},
-			ReturnType: tree.FixedReturnType(types.Bool),
-			Fn: func(ctx context.Context, evalCtx *eval.Context, _ tree.Datums) (tree.Datum, error) {
-				if evalCtx.SessionAccessor == nil {
-					return nil, errors.AssertionFailedf("session accessor not set")
-				}
-				isAdmin, err := evalCtx.SessionAccessor.HasAdminRole(ctx)
-				if err != nil {
-					return nil, err
-				}
-				return tree.MakeDBool(tree.DBool(isAdmin)), nil
-			},
-			Info:       "Retrieves the current user's admin status.",
-			Volatility: volatility.Stable,
-		},
-	),
-
-	// Returns true iff the current user has the specified role option.
-	// Note: it would be a privacy leak to extend this to check arbitrary usernames.
-	"crdb_internal.has_role_option": makeBuiltin(
-		tree.FunctionProperties{
-			Category:         builtinconstants.CategorySystemInfo,
-			DistsqlBlocklist: true,
-		},
-		tree.Overload{
-			Types: tree.ParamTypes{
-				{Name: "option", Typ: types.String},
-			},
-			ReturnType: tree.FixedReturnType(types.Bool),
-			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
-				if evalCtx.SessionAccessor == nil {
-					return nil, errors.AssertionFailedf("session accessor not set")
-				}
-				optionStr := string(tree.MustBeDString(args[0]))
-				option, ok := roleoption.ByName[optionStr]
-				if !ok {
-					return nil, errors.Newf("unrecognized role option %s", optionStr)
-				}
-				ok, err := evalCtx.SessionAccessor.HasRoleOption(ctx, option)
-				if err != nil {
-					return nil, err
-				}
-				return tree.MakeDBool(tree.DBool(ok)), nil
-			},
-			Info:       "Returns whether the current user has the specified role option",
-			Volatility: volatility.Stable,
-		},
-	),
-
 	"crdb_internal.assignment_cast": makeBuiltin(
 		tree.FunctionProperties{
 			Category: builtinconstants.CategorySystemInfo,
@@ -11244,7 +11187,7 @@ var errInsufficientPriv = pgerror.New(
 // to determine the appropriate offset from now which is likely to be safe for
 // follower reads. It is injected by followerreadsccl. An error may be returned
 // if an enterprise license is not installed.
-var EvalFollowerReadOffset func(logicalClusterID uuid.UUID, _ *cluster.Settings) (time.Duration, error)
+var EvalFollowerReadOffset func(_ *cluster.Settings) (time.Duration, error)
 
 func recentTimestamp(ctx context.Context, evalCtx *eval.Context) (time.Time, error) {
 	if EvalFollowerReadOffset == nil {
@@ -11255,7 +11198,7 @@ func recentTimestamp(ctx context.Context, evalCtx *eval.Context) (time.Time, err
 		)
 		return evalCtx.StmtTimestamp.Add(builtinconstants.DefaultFollowerReadDuration), nil
 	}
-	offset, err := EvalFollowerReadOffset(evalCtx.ClusterID, evalCtx.Settings)
+	offset, err := EvalFollowerReadOffset(evalCtx.Settings)
 	if err != nil {
 		if code := pgerror.GetPGCode(err); code == pgcode.CCLValidLicenseRequired {
 			telemetry.Inc(sqltelemetry.FollowerReadDisabledNoEnterpriseLicense)

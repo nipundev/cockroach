@@ -4249,4 +4249,3 @@ SELECT * FROM [EXPLAIN INSERT INTO regional_by_row_table (pk, pk2, a, b) VALUES 
   uniqueness check: regional_by_row_table@regional_by_row_table_b_key
   uniqueness check: regional_by_row_table@regional_by_row_table_b_a_key
   size: 9 columns, 1 row
-

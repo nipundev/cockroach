@@ -512,16 +512,6 @@ func createChangefeedJobRecord(
 			return nil, err
 		}
 		if withDiff {
-			if !p.ExecCfg().Settings.Version.IsActive(ctx, clusterversion.TODO_Delete_V23_1_ChangefeedExpressionProductionReady) {
-				return nil,
-					pgerror.Newf(
-						pgcode.FeatureNotSupported,
-						"cannot create new changefeed with CDC expression <%s>, "+
-							"which requires access to cdc_prev until cluster upgrade to %s finalized.",
-						tree.AsString(normalized),
-						clusterversion.TODO_Delete_V23_1_ChangefeedExpressionProductionReady.String,
-					)
-			}
 			opts.ForceDiff()
 		} else if opts.IsSet(changefeedbase.OptDiff) {
 			// Expression didn't reference cdc_prev, but the diff option was specified.
@@ -615,7 +605,7 @@ func createChangefeedJobRecord(
 
 	if scope, ok := opts.GetMetricScope(); ok {
 		if err := utilccl.CheckEnterpriseEnabled(
-			p.ExecCfg().Settings, p.ExecCfg().NodeInfo.LogicalClusterID(), "CHANGEFEED",
+			p.ExecCfg().Settings, "CHANGEFEED",
 		); err != nil {
 			return nil, errors.Wrapf(err,
 				"use of %q option requires an enterprise license.", changefeedbase.OptMetricsScope)
@@ -644,7 +634,7 @@ func createChangefeedJobRecord(
 
 		if details.Select != `` {
 			if err := utilccl.CheckEnterpriseEnabled(
-				p.ExecCfg().Settings, p.ExecCfg().NodeInfo.LogicalClusterID(), "CHANGEFEED",
+				p.ExecCfg().Settings, "CHANGEFEED",
 			); err != nil {
 				return nil, errors.Wrap(err, "use of AS SELECT requires an enterprise license.")
 			}
@@ -664,7 +654,7 @@ func createChangefeedJobRecord(
 	}
 
 	if err := utilccl.CheckEnterpriseEnabled(
-		p.ExecCfg().Settings, p.ExecCfg().NodeInfo.LogicalClusterID(), "CHANGEFEED",
+		p.ExecCfg().Settings, "CHANGEFEED",
 	); err != nil {
 		return nil, err
 	}
@@ -700,6 +690,12 @@ func createChangefeedJobRecord(
 				changefeedbase.OptExecutionLocality, clusterversion.V23_1.String(),
 			)
 		}
+		if err := utilccl.CheckEnterpriseEnabled(
+			p.ExecCfg().Settings, changefeedbase.OptExecutionLocality,
+		); err != nil {
+			return nil, err
+		}
+
 		var executionLocality roachpb.Locality
 		if err := executionLocality.Set(locFilter); err != nil {
 			return nil, err
@@ -1097,11 +1093,7 @@ func (b *changefeedResumer) setJobRunningStatus(
 	}
 
 	status := jobs.RunningStatus(fmt.Sprintf(fmtOrMsg, args...))
-	if err := b.job.NoTxn().RunningStatus(ctx,
-		func(_ context.Context, _ jobspb.Details) (jobs.RunningStatus, error) {
-			return status, nil
-		},
-	); err != nil {
+	if err := b.job.NoTxn().RunningStatus(ctx, status); err != nil {
 		log.Warningf(ctx, "failed to set running status: %v", err)
 	}
 
@@ -1619,9 +1611,8 @@ func failureTypeForStartupError(err error) changefeedbase.FailureType {
 }
 
 // maybeUpgradePreProductionReadyExpression updates job record for the
-// changefeed using CDC transformation, created prior to
-// clusterversion.TODO_Delete_V23_1_ChangefeedExpressionProductionReady. The update happens
-// once cluster version finalized.
+// changefeed using CDC transformation, created prior to 23.1. The update
+// happens once cluster version finalized.
 // Returns nil when nothing needs to be done.
 // Returns fatal error message, causing changefeed to fail, if automatic upgrade
 // cannot for some reason. Returns a transient error to cause job retry/reload
@@ -1642,18 +1633,9 @@ func maybeUpgradePreProductionReadyExpression(
 		return nil
 	}
 
-	if !jobExec.ExecCfg().Settings.Version.IsActive(
-		ctx, clusterversion.TODO_Delete_V23_1_ChangefeedExpressionProductionReady,
-	) {
-		// Can't upgrade job record yet -- wait until upgrade finalized.
-		return nil
-	}
-
-	// Expressions prior to
-	// clusterversion.TODO_Delete_V23_1_ChangefeedExpressionProductionReady were rewritten to
-	// fully qualify all columns/types.  Furthermore, those expressions couldn't
-	// use any functions that depend on session data.  Thus, it is safe to use
-	// minimal session data.
+	// Expressions prior to 23.1 were rewritten to fully qualify all
+	// columns/types. Furthermore, those expressions couldn't use any functions
+	// that depend on session data. Thus, it is safe to use minimal session data.
 	sd := sessiondatapb.SessionData{
 		Database:   "",
 		UserProto:  jobExec.User().EncodeProto(),
@@ -1677,8 +1659,7 @@ func maybeUpgradePreProductionReadyExpression(
 	}
 	details.Select = cdceval.AsStringUnredacted(newExpression)
 
-	const useReadLock = false
-	if err := jobExec.ExecCfg().JobRegistry.UpdateJobWithTxn(ctx, jobID, nil, useReadLock,
+	if err := jobExec.ExecCfg().JobRegistry.UpdateJobWithTxn(ctx, jobID, nil, /* txn */
 		func(txn isql.Txn, md jobs.JobMetadata, ju *jobs.JobUpdater) error {
 			payload := md.Payload
 			payload.Details = jobspb.WrapPayloadDetails(details)

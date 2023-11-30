@@ -303,7 +303,7 @@ func startDistChangefeed(
 			finishedSetupFn = func(flowinfra.Flow) { resultsCh <- tree.Datums(nil) }
 		}
 
-		jobsprofiler.StorePlanDiagram(ctx, execCfg.DistSQLSrv.Stopper, p, execCfg.InternalDB, jobID, execCfg.Settings.Version)
+		jobsprofiler.StorePlanDiagram(ctx, execCfg.DistSQLSrv.Stopper, p, execCfg.InternalDB, jobID)
 
 		// Copy the evalCtx, as dsp.Run() might change it.
 		evalCtxCopy := *evalCtx
@@ -318,7 +318,8 @@ func startDistChangefeed(
 var enableBalancedRangeDistribution = settings.RegisterBoolSetting(
 	settings.ApplicationLevel,
 	"changefeed.balance_range_distribution.enable",
-	"if enabled, the ranges are balanced equally among all nodes",
+	"if enabled, the ranges are balanced equally among all nodes. "+
+		"Note that this is supported only in export mode with initial_scan=only.",
 	util.ConstantWithMetamorphicTestBool(
 		"changefeed.balance_range_distribution.enabled", false),
 	settings.WithName("changefeed.balance_range_distribution.enabled"),

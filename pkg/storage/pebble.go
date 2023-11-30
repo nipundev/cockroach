@@ -48,6 +48,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/errors/oserror"
 	"github.com/cockroachdb/logtags"
@@ -66,7 +67,12 @@ var maxSyncDurationDefault = envutil.EnvOrDefaultDuration("COCKROACH_ENGINE_MAX_
 
 // Default maximum wait time before an EventuallyFileOnlySnapshot transitions
 // to a file-only snapshot.
-var MaxEFOSWait = envutil.EnvOrDefaultDuration("COCKROACH_EFOS_MAX_WAIT", 3*time.Second)
+var MaxEFOSWait = envutil.EnvOrDefaultDuration("COCKROACH_EFOS_MAX_WAIT", func() time.Duration {
+	if buildutil.CrdbTestBuild {
+		return 100 * time.Millisecond
+	}
+	return 3 * time.Second
+}())
 
 // MaxSyncDuration is the threshold above which an observed engine sync duration
 // triggers either a warning or a fatal error.
@@ -922,6 +928,19 @@ func (p *Pebble) GetStoreID() (int32, error) {
 	return storeID, nil
 }
 
+func (p *Pebble) Download(ctx context.Context, span roachpb.Span) error {
+	ctx, sp := tracing.ChildSpan(ctx, "pebble.Download")
+	defer sp.Finish()
+	if p == nil {
+		return nil
+	}
+	downloadSpan := pebble.DownloadSpan{
+		StartKey: span.Key,
+		EndKey:   span.EndKey,
+	}
+	return p.db.Download(ctx, []pebble.DownloadSpan{downloadSpan})
+}
+
 type remoteStorageAdaptor struct {
 	p       *Pebble
 	ctx     context.Context
@@ -976,6 +995,10 @@ func ResolveEncryptedEnvOptions(
 	}
 	return fileRegistry, env, nil
 }
+
+// ConfigureForSharedStorage is used to configure a pebble Options for shared
+// storage.
+var ConfigureForSharedStorage func(opts *pebble.Options, storage remote.Storage) error
 
 // NewPebble creates a new Pebble instance, at the specified path.
 // Do not use directly (except in test); use Open instead.
@@ -1206,11 +1229,12 @@ func NewPebble(ctx context.Context, cfg PebbleConfig) (p *Pebble, err error) {
 	// in it is needed for CRDB to function properly.
 	if cfg.SharedStorage != nil {
 		esWrapper := &externalStorageWrapper{p: p, es: cfg.SharedStorage, ctx: ctx}
-		opts.Experimental.RemoteStorage = remote.MakeSimpleFactory(map[remote.Locator]remote.Storage{
-			"": esWrapper,
-		})
-		opts.Experimental.CreateOnShared = remote.CreateOnSharedLower
-		opts.Experimental.CreateOnSharedLocator = ""
+		if ConfigureForSharedStorage == nil {
+			return nil, errors.New("shared storage requires CCL features")
+		}
+		if err := ConfigureForSharedStorage(opts, esWrapper); err != nil {
+			return nil, errors.Wrap(err, "error when configuring shared storage")
+		}
 	} else {
 		if cfg.RemoteStorageFactory != nil {
 			opts.Experimental.RemoteStorage = remoteStorageAdaptor{p: p, ctx: ctx, factory: cfg.RemoteStorageFactory}
@@ -1396,9 +1420,9 @@ func (p *Pebble) makeMetricEtcEventListener(ctx context.Context) pebble.EventLis
 					// up.
 					log.MakeProcessUnavailable()
 
-					log.Fatalf(ctx, "file write stall detected: %s", info)
+					log.Fatalf(ctx, "disk stall detected: %s", info)
 				} else {
-					p.async(func() { log.Errorf(ctx, "file write stall detected: %s", info) })
+					p.async(func() { log.Errorf(ctx, "disk stall detected: %s", info) })
 				}
 				return
 			}
@@ -1516,16 +1540,17 @@ func (p *Pebble) MVCCIterate(
 	start, end roachpb.Key,
 	iterKind MVCCIterKind,
 	keyTypes IterKeyType,
+	readCategory ReadCategory,
 	f func(MVCCKeyValue, MVCCRangeKeyStack) error,
 ) error {
 	if iterKind == MVCCKeyAndIntentsIterKind {
 		r := wrapReader(p)
 		// Doing defer r.Free() does not inline.
-		err := iterateOnReader(ctx, r, start, end, iterKind, keyTypes, f)
+		err := iterateOnReader(ctx, r, start, end, iterKind, keyTypes, readCategory, f)
 		r.Free()
 		return err
 	}
-	return iterateOnReader(ctx, p, start, end, iterKind, keyTypes, f)
+	return iterateOnReader(ctx, p, start, end, iterKind, keyTypes, readCategory, f)
 }
 
 // NewMVCCIterator implements the Engine interface.
@@ -1566,7 +1591,9 @@ func (p *Pebble) ScanInternal(
 ) error {
 	rawLower := EngineKey{Key: lower}.Encode()
 	rawUpper := EngineKey{Key: upper}.Encode()
-	return p.db.ScanInternal(ctx, rawLower, rawUpper, visitPointKey, visitRangeDel, visitRangeKey, visitSharedFile)
+	// TODO(sumeer): set CategoryAndQoS.
+	return p.db.ScanInternal(ctx, sstable.CategoryAndQoS{}, rawLower, rawUpper, visitPointKey,
+		visitRangeDel, visitRangeKey, visitSharedFile)
 }
 
 // ConsistentIterators implements the Engine interface.
@@ -1575,7 +1602,7 @@ func (p *Pebble) ConsistentIterators() bool {
 }
 
 // PinEngineStateForIterators implements the Engine interface.
-func (p *Pebble) PinEngineStateForIterators() error {
+func (p *Pebble) PinEngineStateForIterators(ReadCategory) error {
 	return errors.AssertionFailedf(
 		"PinEngineStateForIterators must not be called when ConsistentIterators returns false")
 }
@@ -2352,7 +2379,7 @@ func pebbleFormatVersion(clusterVersion roachpb.Version) pebble.FormatMajorVersi
 	// pebbleFormatVersionKeys are sorted in descending order; find the first one
 	// that is not newer than clusterVersion.
 	for _, k := range pebbleFormatVersionKeys {
-		if clusterVersion.AtLeast(clusterversion.ByKey(k)) {
+		if clusterVersion.AtLeast(k.Version()) {
 			return pebbleFormatVersionMap[k]
 		}
 	}
@@ -2589,6 +2616,7 @@ func (p *pebbleReadOnly) MVCCIterate(
 	start, end roachpb.Key,
 	iterKind MVCCIterKind,
 	keyTypes IterKeyType,
+	readCategory ReadCategory,
 	f func(MVCCKeyValue, MVCCRangeKeyStack) error,
 ) error {
 	if p.closed {
@@ -2597,11 +2625,11 @@ func (p *pebbleReadOnly) MVCCIterate(
 	if iterKind == MVCCKeyAndIntentsIterKind {
 		r := wrapReader(p)
 		// Doing defer r.Free() does not inline.
-		err := iterateOnReader(ctx, r, start, end, iterKind, keyTypes, f)
+		err := iterateOnReader(ctx, r, start, end, iterKind, keyTypes, readCategory, f)
 		r.Free()
 		return err
 	}
-	return iterateOnReader(ctx, p, start, end, iterKind, keyTypes, f)
+	return iterateOnReader(ctx, p, start, end, iterKind, keyTypes, readCategory, f)
 }
 
 // NewMVCCIterator implements the Engine interface.
@@ -2698,11 +2726,11 @@ func (p *pebbleReadOnly) ConsistentIterators() bool {
 }
 
 // PinEngineStateForIterators implements the Engine interface.
-func (p *pebbleReadOnly) PinEngineStateForIterators() error {
+func (p *pebbleReadOnly) PinEngineStateForIterators(readCategory ReadCategory) error {
 	if p.iter == nil {
-		o := (*pebble.IterOptions)(nil)
+		o := &pebble.IterOptions{CategoryAndQoS: getCategoryAndQoS(readCategory)}
 		if p.durability == GuaranteedDurability {
-			o = &pebble.IterOptions{OnlyReadGuaranteedDurable: true}
+			o.OnlyReadGuaranteedDurable = true
 		}
 		iter, err := p.parent.db.NewIter(o)
 		if err != nil {
@@ -2852,16 +2880,17 @@ func (p *pebbleSnapshot) MVCCIterate(
 	start, end roachpb.Key,
 	iterKind MVCCIterKind,
 	keyTypes IterKeyType,
+	readCategory ReadCategory,
 	f func(MVCCKeyValue, MVCCRangeKeyStack) error,
 ) error {
 	if iterKind == MVCCKeyAndIntentsIterKind {
 		r := wrapReader(p)
 		// Doing defer r.Free() does not inline.
-		err := iterateOnReader(ctx, r, start, end, iterKind, keyTypes, f)
+		err := iterateOnReader(ctx, r, start, end, iterKind, keyTypes, readCategory, f)
 		r.Free()
 		return err
 	}
-	return iterateOnReader(ctx, p, start, end, iterKind, keyTypes, f)
+	return iterateOnReader(ctx, p, start, end, iterKind, keyTypes, readCategory, f)
 }
 
 // NewMVCCIterator implements the Reader interface.
@@ -2899,7 +2928,7 @@ func (p pebbleSnapshot) ConsistentIterators() bool {
 }
 
 // PinEngineStateForIterators implements the Reader interface.
-func (p *pebbleSnapshot) PinEngineStateForIterators() error {
+func (p *pebbleSnapshot) PinEngineStateForIterators(ReadCategory) error {
 	// Snapshot already pins state, so nothing to do.
 	return nil
 }
@@ -2915,7 +2944,9 @@ func (p *pebbleSnapshot) ScanInternal(
 ) error {
 	rawLower := EngineKey{Key: lower}.Encode()
 	rawUpper := EngineKey{Key: upper}.Encode()
-	return p.snapshot.ScanInternal(ctx, rawLower, rawUpper, visitPointKey, visitRangeDel, visitRangeKey, visitSharedFile)
+	// TODO(sumeer): set CategoryAndQoS.
+	return p.snapshot.ScanInternal(ctx, sstable.CategoryAndQoS{}, rawLower, rawUpper, visitPointKey,
+		visitRangeDel, visitRangeKey, visitSharedFile)
 }
 
 // pebbleEFOS represents an eventually file-only snapshot created using
@@ -2946,16 +2977,17 @@ func (p *pebbleEFOS) MVCCIterate(
 	start, end roachpb.Key,
 	iterKind MVCCIterKind,
 	keyTypes IterKeyType,
+	readCategory ReadCategory,
 	f func(MVCCKeyValue, MVCCRangeKeyStack) error,
 ) error {
 	if iterKind == MVCCKeyAndIntentsIterKind {
 		r := wrapReader(p)
 		// Doing defer r.Free() does not inline.
-		err := iterateOnReader(ctx, r, start, end, iterKind, keyTypes, f)
+		err := iterateOnReader(ctx, r, start, end, iterKind, keyTypes, readCategory, f)
 		r.Free()
 		return err
 	}
-	return iterateOnReader(ctx, p, start, end, iterKind, keyTypes, f)
+	return iterateOnReader(ctx, p, start, end, iterKind, keyTypes, readCategory, f)
 }
 
 // WaitForFileOnly implements the EventuallyFileOnlyReader interface.
@@ -3017,7 +3049,7 @@ func (p *pebbleEFOS) ConsistentIterators() bool {
 }
 
 // PinEngineStateForIterators implements the Reader interface.
-func (p *pebbleEFOS) PinEngineStateForIterators() error {
+func (p *pebbleEFOS) PinEngineStateForIterators(ReadCategory) error {
 	// Snapshot already pins state, so nothing to do.
 	return nil
 }
@@ -3033,7 +3065,9 @@ func (p *pebbleEFOS) ScanInternal(
 ) error {
 	rawLower := EngineKey{Key: lower}.Encode()
 	rawUpper := EngineKey{Key: upper}.Encode()
-	return p.efos.ScanInternal(ctx, rawLower, rawUpper, visitPointKey, visitRangeDel, visitRangeKey, visitSharedFile)
+	// TODO(sumeer): set CategoryAndQoS.
+	return p.efos.ScanInternal(ctx, sstable.CategoryAndQoS{}, rawLower, rawUpper, visitPointKey,
+		visitRangeDel, visitRangeKey, visitSharedFile)
 }
 
 // ExceedMaxSizeError is the error returned when an export request

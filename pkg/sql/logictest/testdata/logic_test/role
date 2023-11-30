@@ -257,12 +257,6 @@ user root
 statement ok
 GRANT admin TO testuser
 
-# Verify that is_admin reports the right value.
-query B
-SELECT crdb_internal.is_admin()
-----
-true
-
 # Dropping users/roles deletes all their memberships.
 query TTBOO colnames,rowsort
 SELECT * FROM system.role_members
@@ -539,6 +533,18 @@ CREATE ROLE roleb
 
 statement ok
 GRANT rolea,roleb TO testuser WITH ADMIN OPTION
+
+statement error role/user "" does not exist
+GRANT rolea TO ""
+
+statement error role/user "" does not exist
+REVOKE rolea FROM ""
+
+statement error role/user "" does not exist
+GRANT "" TO rolea
+
+statement error role/user "" does not exist
+REVOKE "" FROM rolea
 
 query TTBOO colnames,rowsort
 SELECT * FROM system.role_members

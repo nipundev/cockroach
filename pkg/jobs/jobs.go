@@ -19,7 +19,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
@@ -64,7 +63,7 @@ type Job struct {
 	}
 }
 
-// CreatedByInfo encapsulates they type and the ID of the system which created
+// CreatedByInfo encapsulates the type and the ID of the system which created
 // this job.
 type CreatedByInfo struct {
 	Name string
@@ -279,28 +278,12 @@ func (u Updater) CheckStatus(ctx context.Context) error {
 	})
 }
 
-// CheckTerminalStatus returns true if the job is in a terminal status.
-func (u Updater) CheckTerminalStatus(ctx context.Context) bool {
-	err := u.Update(ctx, func(_ isql.Txn, md JobMetadata, _ *JobUpdater) error {
-		if !md.Status.Terminal() {
-			return &InvalidStatusError{md.ID, md.Status, "checking that job status is success", md.Payload.Error}
-		}
-		return nil
-	})
-
-	return err == nil
-}
-
 // RunningStatus updates the detailed status of a job currently in progress.
 // It sets the job's RunningStatus field to the value returned by runningStatusFn
 // and persists runningStatusFn's modifications to the job's details, if any.
-func (u Updater) RunningStatus(ctx context.Context, runningStatusFn RunningStatusFn) error {
+func (u Updater) RunningStatus(ctx context.Context, runningStatus RunningStatus) error {
 	return u.Update(ctx, func(_ isql.Txn, md JobMetadata, ju *JobUpdater) error {
 		if err := md.CheckRunningOrReverting(); err != nil {
-			return err
-		}
-		runningStatus, err := runningStatusFn(ctx, md.Progress.Details)
-		if err != nil {
 			return err
 		}
 		md.Progress.RunningStatus = string(runningStatus)
@@ -308,11 +291,6 @@ func (u Updater) RunningStatus(ctx context.Context, runningStatusFn RunningStatu
 		return nil
 	})
 }
-
-// RunningStatusFn is a callback that computes a job's running status
-// given its details. It is safe to modify details in the callback; those
-// modifications will be automatically persisted to the database record.
-type RunningStatusFn func(ctx context.Context, details jobspb.Details) (RunningStatus, error)
 
 // NonCancelableUpdateFn is a callback that computes a job's non-cancelable
 // status given its current one.
@@ -741,64 +719,28 @@ func (j *Job) loadJobPayloadAndProgress(
 
 	payload := &jobspb.Payload{}
 	progress := &jobspb.Progress{}
-	if st.Version.IsActive(ctx, clusterversion.TODO_Delete_V23_1JobInfoTableIsBackfilled) {
-		infoStorage := j.InfoStorage(txn)
+	infoStorage := j.InfoStorage(txn)
 
-		payloadBytes, exists, err := infoStorage.GetLegacyPayload(ctx)
-		if err != nil {
-			return nil, nil, errors.Wrapf(err, "failed to get payload for job %d", j.ID())
-		}
-		if !exists {
-			return nil, nil, errors.Wrap(&JobNotFoundError{jobID: j.ID()}, "job payload not found in system.job_info")
-		}
-		if err := protoutil.Unmarshal(payloadBytes, payload); err != nil {
-			return nil, nil, err
-		}
-
-		progressBytes, exists, err := infoStorage.GetLegacyProgress(ctx)
-		if err != nil {
-			return nil, nil, errors.Wrapf(err, "failed to get progress for job %d", j.ID())
-		}
-		if !exists {
-			return nil, nil, errors.Wrap(&JobNotFoundError{jobID: j.ID()}, "job progress not found in system.job_info")
-		}
-		if err := protoutil.Unmarshal(progressBytes, progress); err != nil {
-			return nil, nil, &JobNotFoundError{jobID: j.ID()}
-		}
-
-		return payload, progress, nil
-	}
-
-	// If TODO_Delete_V23_1JobInfoTableIsBackfilled is not active we should read the payload
-	// and progress from the system.jobs table.
-	const (
-		queryNoSessionID   = "SELECT payload, progress FROM system.jobs WHERE id = $1"
-		queryWithSessionID = queryNoSessionID + " AND claim_session_id = $2"
-	)
-	sess := sessiondata.RootUserSessionDataOverride
-
-	var err error
-	var row tree.Datums
-	if j.session == nil {
-		row, err = txn.QueryRowEx(ctx, "load-job-payload-progress-query", txn.KV(), sess,
-			queryNoSessionID, j.ID())
-	} else {
-		row, err = txn.QueryRowEx(ctx, "load-job-payload-progress-query", txn.KV(), sess,
-			queryWithSessionID, j.ID(), j.session.ID().UnsafeBytes())
-	}
+	payloadBytes, exists, err := infoStorage.GetLegacyPayload(ctx)
 	if err != nil {
+		return nil, nil, errors.Wrapf(err, "failed to get payload for job %d", j.ID())
+	}
+	if !exists {
+		return nil, nil, errors.Wrap(&JobNotFoundError{jobID: j.ID()}, "job payload not found in system.job_info")
+	}
+	if err := protoutil.Unmarshal(payloadBytes, payload); err != nil {
 		return nil, nil, err
 	}
-	if row == nil {
+
+	progressBytes, exists, err := infoStorage.GetLegacyProgress(ctx)
+	if err != nil {
+		return nil, nil, errors.Wrapf(err, "failed to get progress for job %d", j.ID())
+	}
+	if !exists {
+		return nil, nil, errors.Wrap(&JobNotFoundError{jobID: j.ID()}, "job progress not found in system.job_info")
+	}
+	if err := protoutil.Unmarshal(progressBytes, progress); err != nil {
 		return nil, nil, &JobNotFoundError{jobID: j.ID()}
-	}
-	payload, err = UnmarshalPayload(row[0])
-	if err != nil {
-		return nil, nil, err
-	}
-	progress, err = UnmarshalProgress(row[1])
-	if err != nil {
-		return nil, nil, err
 	}
 
 	return payload, progress, nil
@@ -1134,12 +1076,10 @@ func FormatRetriableExecutionErrorLogToStringArray(
 }
 
 // GetJobTraceID returns the current trace ID of the job from the job progress.
-func GetJobTraceID(
-	ctx context.Context, db isql.DB, jobID jobspb.JobID, cv clusterversion.Handle,
-) (tracingpb.TraceID, error) {
+func GetJobTraceID(ctx context.Context, db isql.DB, jobID jobspb.JobID) (tracingpb.TraceID, error) {
 	var traceID tracingpb.TraceID
 	if err := db.Txn(ctx, func(ctx context.Context, txn isql.Txn) error {
-		jobInfo := InfoStorageForJob(txn, jobID, cv)
+		jobInfo := InfoStorageForJob(txn, jobID)
 		progressBytes, exists, err := jobInfo.GetLegacyProgress(ctx)
 		if err != nil {
 			return err
@@ -1163,14 +1103,14 @@ func GetJobTraceID(
 // LoadJobProgress returns the job progress from the info table. Note that the
 // progress can be nil if none is recorded.
 func LoadJobProgress(
-	ctx context.Context, db isql.DB, jobID jobspb.JobID, cv clusterversion.Handle,
+	ctx context.Context, db isql.DB, jobID jobspb.JobID,
 ) (*jobspb.Progress, error) {
 	var (
 		progressBytes []byte
 		exists        bool
 	)
 	if err := db.Txn(ctx, func(ctx context.Context, txn isql.Txn) error {
-		infoStorage := InfoStorageForJob(txn, jobID, cv)
+		infoStorage := InfoStorageForJob(txn, jobID)
 		var err error
 		progressBytes, exists, err = infoStorage.GetLegacyProgress(ctx)
 		return err

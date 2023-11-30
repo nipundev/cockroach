@@ -89,6 +89,9 @@ type LockTableIteratorOptions struct {
 	// If set, return locks held by any transaction with this strength or
 	// stronger.
 	MatchMinStr lock.Strength
+	// ReadCategory is used to map to a user-understandable category string, for
+	// stats aggregation and metrics, and a Pebble-understandable QoS.
+	ReadCategory ReadCategory
 }
 
 // validate validates the LockTableIteratorOptions.
@@ -478,6 +481,11 @@ func (i *LockTableIterator) CloneContext() CloneContext {
 // Stats implements the EngineIterator interface.
 func (i *LockTableIterator) Stats() IteratorStats {
 	return i.iter.Stats()
+}
+
+// CanDeterministicallySingleDelete implements the EngineIterator interface.
+func (i *LockTableIterator) CanDeterministicallySingleDelete() (ok bool, err error) {
+	return i.iter.CanDeterministicallySingleDelete()
 }
 
 //gcassert:inline

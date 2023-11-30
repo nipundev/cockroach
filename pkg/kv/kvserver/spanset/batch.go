@@ -434,6 +434,12 @@ func (i *EngineIterator) Stats() storage.IteratorStats {
 	return i.i.Stats()
 }
 
+// CanDeterministicallySingleDelete is part of the storage.EngineIterator
+// interface.
+func (i *EngineIterator) CanDeterministicallySingleDelete() (bool, error) {
+	return i.i.CanDeterministicallySingleDelete()
+}
+
 type spanSetReader struct {
 	r     storage.Reader
 	spans *SpanSet
@@ -468,6 +474,7 @@ func (s spanSetReader) MVCCIterate(
 	start, end roachpb.Key,
 	iterKind storage.MVCCIterKind,
 	keyTypes storage.IterKeyType,
+	readCategory storage.ReadCategory,
 	f func(storage.MVCCKeyValue, storage.MVCCRangeKeyStack) error,
 ) error {
 	if s.spansOnly {
@@ -479,7 +486,7 @@ func (s spanSetReader) MVCCIterate(
 			return err
 		}
 	}
-	return s.r.MVCCIterate(ctx, start, end, iterKind, keyTypes, f)
+	return s.r.MVCCIterate(ctx, start, end, iterKind, keyTypes, readCategory, f)
 }
 
 func (s spanSetReader) NewMVCCIterator(
@@ -516,8 +523,8 @@ func (s spanSetReader) ConsistentIterators() bool {
 }
 
 // PinEngineStateForIterators implements the storage.Reader interface.
-func (s spanSetReader) PinEngineStateForIterators() error {
-	return s.r.PinEngineStateForIterators()
+func (s spanSetReader) PinEngineStateForIterators(readCategory storage.ReadCategory) error {
+	return s.r.PinEngineStateForIterators(readCategory)
 }
 
 type spanSetWriter struct {

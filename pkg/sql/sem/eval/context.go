@@ -26,7 +26,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/repstream/streampb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
@@ -287,12 +286,6 @@ type Context struct {
 	// execution until control returns to the parent routine. It is only valid
 	// during local execution. It may be unset.
 	RoutineSender DeferredRoutineSender
-
-	// RoleExistsCache is a cache of role existence checks. This is used because
-	// role existence checks are made when checking privileges, which can happen
-	// multiple times during the execution of a single query. Only positive
-	// values are cached. This cache is populated from the extraTxnState.
-	RoleExistsCache map[username.SQLUsername]struct{}
 }
 
 // JobsProfiler is the interface used to fetch job specific execution details
@@ -874,20 +867,7 @@ type ReplicationStreamManager interface {
 // StreamIngestManager represents a collection of APIs that streaming replication supports
 // on the ingestion side.
 type StreamIngestManager interface {
-	// CompleteStreamIngestion signals a running stream ingestion job to complete on the consumer side.
-	CompleteStreamIngestion(
-		ctx context.Context,
-		ingestionJobID jobspb.JobID,
-		cutoverTimestamp hlc.Timestamp,
-	) error
-
 	// GetStreamIngestionStats gets a statistics summary for a stream ingestion job.
-	GetStreamIngestionStats(
-		ctx context.Context,
-		streamIngestionDetails jobspb.StreamIngestionDetails,
-		jobProgress jobspb.Progress,
-	) (*streampb.StreamIngestionStats, error)
-
 	GetReplicationStatsAndStatus(
 		ctx context.Context,
 		ingestionJobID jobspb.JobID,

@@ -756,6 +756,7 @@ func (s *SQLServerWrapper) PreStart(ctx context.Context) error {
 			s.sqlServer.cfg.CPUProfileDirName,
 			s.runtime,
 			s.tenantStatus.sessionRegistry,
+			s.sqlServer.execCfg.RootMemoryMonitor,
 		); err != nil {
 			return err
 		}
@@ -862,6 +863,7 @@ func (s *SQLServerWrapper) PreStart(ctx context.Context) error {
 	}
 	s.eventsExporter.SetNodeInfo(obs.NodeInfo{
 		ClusterID:     clusterID,
+		TenantID:      int64(s.rpcContext.TenantID.InternalValue),
 		NodeID:        int32(instanceID),
 		BinaryVersion: build.BinaryVersion(),
 	})

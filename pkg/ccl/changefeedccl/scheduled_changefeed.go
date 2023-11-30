@@ -322,7 +322,7 @@ func makeScheduledChangefeedSpec(
 	}
 
 	enterpriseCheckErr := utilccl.CheckEnterpriseEnabled(
-		p.ExecCfg().Settings, p.ExecCfg().NodeInfo.LogicalClusterID(),
+		p.ExecCfg().Settings,
 		opName)
 
 	if !(enterpriseCheckErr == nil) {
@@ -684,15 +684,6 @@ func createChangefeedScheduleTypeCheck(
 	schedule, ok := stmt.(*tree.ScheduledChangefeed)
 	if !ok {
 		return false, nil, nil
-	}
-
-	if !p.ExecCfg().Settings.Version.IsActive(ctx, clusterversion.TODO_Delete_V23_1ScheduledChangefeeds) {
-		return false, nil,
-			pgerror.Newf(
-				pgcode.FeatureNotSupported,
-				"cannot use scheduled changefeeds until cluster is upgraded to %s",
-				clusterversion.TODO_Delete_V23_1ScheduledChangefeeds.String,
-			)
 	}
 
 	changefeedStmt := schedule.CreateChangefeed
